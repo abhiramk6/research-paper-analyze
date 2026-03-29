@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+.DS_Store
+.streamlit/
+
+reports/*
+!reports/test-case/
+!reports/test-case/report.md
+
+*.log
+*.tmp
+
