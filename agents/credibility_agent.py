@@ -18,10 +18,6 @@ from prompt_loader import load_prompt
 from scoring.credibility_model import compute_credibility_breakdown
 
 
-# ---------------------------------------------------------------------------
-# Legacy heuristic scorer (v1 — kept for backward compatibility / fallback)
-# ---------------------------------------------------------------------------
-
 def compute_credibility_score(
     consistency: ConsistencyResult,
     grammar: GrammarResult,
@@ -79,10 +75,6 @@ def _local_risk_factors(
     return factors or ["No major cross-signal risk factors were identified."]
 
 
-# ---------------------------------------------------------------------------
-# Main entry point (v2 — uses evidence-backed scoring when available)
-# ---------------------------------------------------------------------------
-
 def run_credibility_agent(
     consistency: ConsistencyResult,
     grammar: GrammarResult,
@@ -90,23 +82,11 @@ def run_credibility_agent(
     factcheck: FactCheckResult,
     novelty: NoveltyResult,
     critic_feedback: dict | None = None,
-    # v2 evidence-backed inputs (optional — fall back to legacy if absent)
     evidence_results: list[EvidenceFactCheckItem] | None = None,
     claims: list[Claim] | None = None,
 ) -> CredibilityResult:
-    """
-    Synthesise all signals into a final CredibilityResult.
-
-    When `evidence_results` are available (v2 pipeline), the score is computed
-    from the interpretable CredibilityBreakdown model.  Without them, falls
-    back to the v1 heuristic formula so the pipeline never breaks.
-
-    The LLM is only used to produce narrative risk factors and reasoning text —
-    the numeric score is always deterministic and formula-based.
-    """
     critic_feedback = critic_feedback or {}
 
-    # --- Score computation ---
     if evidence_results is not None and claims is not None:
         breakdown: CredibilityBreakdown = compute_credibility_breakdown(
             evidence_results=evidence_results,
@@ -125,7 +105,6 @@ def run_credibility_agent(
 
     fallback_factors = _local_risk_factors(consistency, grammar, citation, factcheck, novelty)
 
-    # --- LLM narrative (non-numeric) ---
     prompt = load_prompt(
         "credibility_review.txt",
         schema_json='{"risk_factors": ["string"], "reasoning": "string"}',

@@ -1,24 +1,5 @@
 from __future__ import annotations
 
-"""
-Section normalizer: maps raw PDF section headings to canonical semantic categories
-via a single LLM call.
-
-Why: PDF papers use wildly different heading styles —
-  "3. Our Proposed Architecture"  →  methodology
-  "4.2 Quantitative Analysis"     →  results
-  "5 Related Literature"          →  related_work
-  ...etc.
-
-The downstream pipeline uses keyword matching on headings to build evidence packets
-(e.g. "give me the 'methodology' sections"). Without normalization, a heading like
-"Our Approach" never matches the keyword "method", so evidence packets come back empty.
-
-This module runs ONE LLM call over the full heading list and returns a
-heading → canonical_category mapping that gets stored on each PaperSection.
-Falls back gracefully to heuristic mapping if the LLM fails or quota is exhausted.
-"""
-
 import json
 import logging
 import re
@@ -29,7 +10,6 @@ from models.schema import PaperDocument, PaperSection
 
 logger = logging.getLogger(__name__)
 
-# Canonical categories the LLM must choose from.
 CANONICAL_CATEGORIES = [
     "abstract",
     "introduction",
@@ -44,7 +24,6 @@ CANONICAL_CATEGORIES = [
     "other",
 ]
 
-# Heuristic fallback patterns for when LLM is unavailable.
 _HEURISTIC_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\babstract\b", re.I), "abstract"),
     (re.compile(r"\bintroduct", re.I), "introduction"),
@@ -89,24 +68,16 @@ def _build_prompt(headings: list[str]) -> str:
 
 
 def normalize_section_headings(document: PaperDocument) -> PaperDocument:
-    """
-    Run one LLM call to map every raw section heading to a canonical category.
-    Stores the result on each PaperSection.canonical_category.
-    Falls back to heuristic patterns on LLM failure.
-    """
     headings = [section.heading for section in document.sections]
     if not headings:
         return document
 
-    # Build heuristic fallback mapping up front.
     heuristic_map = {h: _heuristic_category(h) for h in headings}
-
-    fallback = heuristic_map  # fallback is the full heading→category dict
+    fallback = heuristic_map
 
     prompt = _build_prompt(headings)
     raw = call_llm_json(prompt, fallback=fallback)
 
-    # Validate: only keep keys that are known headings and values that are valid categories.
     valid_categories = set(CANONICAL_CATEGORIES)
     llm_map: dict[str, str] = {}
     for key, value in raw.items():
@@ -115,10 +86,7 @@ def normalize_section_headings(document: PaperDocument) -> PaperDocument:
             if cat in valid_categories:
                 llm_map[key] = cat
 
-    # Merge: LLM result takes priority; heuristic fills any gaps.
     final_map = {**heuristic_map, **llm_map}
-
-    # Annotate sections.
     updated_sections = [
         section.model_copy(update={"canonical_category": final_map.get(section.heading, "other")})
         for section in document.sections

@@ -5,6 +5,7 @@ __pycache__/
 
 .DS_Store
 .streamlit/
+.idea/
 
 reports/*
 !reports/test-case/
@@ -12,4 +13,3 @@ reports/*
 
 *.log
 *.tmp
-

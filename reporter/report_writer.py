@@ -80,7 +80,6 @@ def _claim_type_label(claim_type: str) -> str:
         "methodology_assertion": "methodology assertion",
         "contribution_claim": "contribution claim",
         "unsupported_general_statement": "general statement",
-        # Legacy
         "contribution": "contribution",
         "result": "result",
         "novelty": "novelty",
@@ -103,11 +102,6 @@ def _confidence_label(confidence: float) -> str:
         return f"low ({confidence:.2f})"
     return f"marginal ({confidence:.2f})"
 
-
-# ---------------------------------------------------------------------------
-# Evidence-backed fact-check log (v2)
-# ---------------------------------------------------------------------------
-
 def _build_evidence_factcheck_log(evidence_results: list[EvidenceFactCheckItem]) -> str:
     if not evidence_results:
         return (
@@ -128,7 +122,6 @@ def _build_evidence_factcheck_log(evidence_results: list[EvidenceFactCheckItem])
         f"out of {len(evidence_results)} evidence-checked claims."
     )
 
-    # Summary table
     table_rows = "\n".join(
         f"| `{r.claim_id}` | {_verdict_badge(r.verdict)} | {round(r.confidence * 100)}% | "
         f"{r.reasoning[:120].replace('|', '/')}... |"
@@ -140,7 +133,6 @@ def _build_evidence_factcheck_log(evidence_results: list[EvidenceFactCheckItem])
         + table_rows
     )
 
-    # Per-claim detail blocks with evidence sources
     detail_blocks = []
     for r in evidence_results:
         block = f"#### `{r.claim_id}` — {_verdict_badge(r.verdict)}\n\n"
@@ -197,11 +189,6 @@ def _build_evidence_factcheck_log(evidence_results: list[EvidenceFactCheckItem])
         f"{detail_section}\n"
     )
 
-
-# ---------------------------------------------------------------------------
-# Legacy fact-check log (v1, kept as fallback when no evidence results)
-# ---------------------------------------------------------------------------
-
 def _build_factcheck_log(factcheck: FactCheckResult) -> str:
     if not factcheck.items:
         return (
@@ -242,11 +229,6 @@ def _build_factcheck_log(factcheck: FactCheckResult) -> str:
         + ("\n\n".join(notes) + "\n" if notes else "")
     )
 
-
-# ---------------------------------------------------------------------------
-# Credibility breakdown table (v2)
-# ---------------------------------------------------------------------------
-
 def _build_credibility_breakdown(breakdown: CredibilityBreakdown) -> str:
     band_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(breakdown.risk_band, "")
 
@@ -275,11 +257,6 @@ def _build_credibility_breakdown(breakdown: CredibilityBreakdown) -> str:
         f"#### Score Components\n\n{feature_table}\n\n"
         f"#### Explanation\n\n{breakdown.explanation}\n"
     )
-
-
-# ---------------------------------------------------------------------------
-# Claims section
-# ---------------------------------------------------------------------------
 
 def _build_claims_section(
     claims: list[Claim],
@@ -349,11 +326,6 @@ def _build_claims_section(
         f"### Per-Claim Detailed Analysis\n\n{detail_section}\n"
     )
 
-
-# ---------------------------------------------------------------------------
-# Main save_report
-# ---------------------------------------------------------------------------
-
 def save_report(
     report: FinalReport,
     claims: list[Claim],
@@ -375,7 +347,6 @@ def save_report(
     citation_label = _score_label(report.citation_score)
     risk_label = _risk_label(report.credibility_score)
 
-    # Grammar section
     if grammar:
         grammar_detail = {
             "High": "Publication-ready prose. Grammar, tone, and clarity meet or exceed the standard expected at peer-reviewed venues.",
@@ -406,13 +377,11 @@ def save_report(
 
     claims_section = _build_claims_section(claims, factcheck, evidence_results)
 
-    # Use evidence-backed log if available, else legacy.
     if evidence_results:
         factcheck_section = _build_evidence_factcheck_log(evidence_results)
     else:
         factcheck_section = _build_factcheck_log(factcheck)
 
-    # Credibility breakdown (v2) or legacy description.
     breakdown = credibility.breakdown
     if breakdown:
         credibility_detail = _build_credibility_breakdown(breakdown)

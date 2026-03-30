@@ -10,13 +10,10 @@ class PaperSection(BaseModel):
     heading: str
     content: str
     token_count: int = 0
-    # LLM-assigned canonical category (e.g. "methodology", "results", "introduction").
-    # Populated by the section normalizer after parsing; None until then.
     canonical_category: Optional[str] = None
 
 
 class PaperChunk(BaseModel):
-    """A bounded text chunk derived from a section, used as the primary unit for claim extraction."""
     chunk_id: str
     section_name: str
     chunk_index: int
@@ -41,16 +38,13 @@ class PaperDocument(BaseModel):
     chunks: list[PaperChunk] = Field(default_factory=list)
 
 
-# Extended claim type set — includes both legacy types and new typed categories.
 ClaimType = Literal[
-    # New typed categories (v2)
     "benchmark_result",
     "prior_work_comparison",
     "factual_background",
     "methodology_assertion",
     "contribution_claim",
     "unsupported_general_statement",
-    # Legacy types (v1) — kept for backward compatibility
     "contribution",
     "result",
     "novelty",
@@ -79,7 +73,6 @@ class Claim(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    """A single piece of external evidence retrieved for a claim."""
     evidence_id: str
     title: str
     url: str
@@ -90,7 +83,6 @@ class EvidenceItem(BaseModel):
 
 
 class EvidenceFactCheckItem(BaseModel):
-    """Evidence-backed fact-check result for a single claim."""
     claim_id: str
     verdict: Literal[
         "supported",
@@ -107,7 +99,6 @@ class EvidenceFactCheckItem(BaseModel):
 
 
 class CredibilityBreakdown(BaseModel):
-    """Interpretable, feature-level credibility breakdown replacing the opaque fabrication score."""
     supported_claim_ratio: float = 0.0
     contradicted_claim_ratio: float = 0.0
     insufficient_evidence_ratio: float = 0.0

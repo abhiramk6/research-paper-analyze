@@ -34,14 +34,8 @@ from verification.verifier_agent import verify_claim
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Shared retriever — constructed once per pipeline run.
 _RETRIEVER = EvidenceRetriever()
-
-# Top-K evidence items forwarded to each verifier call.
 _VERIFIER_TOP_K = 5
-
-# Maximum retries for weak-evidence high-importance claims.
-_MAX_RETRIES = 1
 
 
 class EvaluatorState(TypedDict, total=False):
@@ -62,9 +56,7 @@ class EvaluatorState(TypedDict, total=False):
     report: Any
     report_path: str
     paper_id: str
-    # v2 — evidence-backed verification results
     evidence_results: list[Any]
-    # routing metadata for debugging / agentic transparency
     routing_log: list[dict[str, Any]]
 
 
@@ -81,14 +73,6 @@ def _section_snapshot(document) -> list[dict[str, Any]]:
 
 
 def _section_matches(section_heading: str, keywords: list[str], canonical: str | None = None) -> bool:
-    """
-    Match a section against a list of keywords.
-
-    Checks canonical category first (exact or substring), then falls back to
-    raw heading keyword matching.  The canonical category comes from the LLM
-    normalizer, so "3. Our Proposed Architecture" → canonical="methodology"
-    will correctly match keyword "method".
-    """
     kw_lower = [k.lower() for k in keywords]
     if canonical:
         cat = canonical.lower()
@@ -114,7 +98,6 @@ def _packet_from_keywords(document, keywords: list[str], fallback_headings: list
         if _section_matches(section.heading, keywords, canonical=section.canonical_category)
     ]
     if not selected:
-        # Canonical fallback: match against canonical categories directly.
         selected = [
             f"[{section.heading}]\n{section.content.strip()}"
             for section in document.sections
@@ -131,28 +114,17 @@ def _packet_from_keywords(document, keywords: list[str], fallback_headings: list
 
 
 def _paper_context_for_claim(document, claim) -> str:
-    """Return a short paper-local context snippet for a claim, capped for verifier budget."""
     target_heading = claim.source_section or ""
     for section in document.sections:
         if target_heading.lower() in section.heading.lower() or section.heading.lower() in target_heading.lower():
             return section.content[:1_200]
     return document.abstract[:800]
 
-
-# ---------------------------------------------------------------------------
-# Pipeline nodes
-# ---------------------------------------------------------------------------
-
 def ingest_paper_node(state: EvaluatorState) -> EvaluatorState:
     pdf_path = download_pdf(state["url"])
     document = parse_paper(pdf_path, source_url=state["url"])
-    # Update token counts on sections.
     document = chunk_all_sections(document)
-    # LLM-normalize raw PDF headings → canonical categories (methodology, results, etc.)
-    # This runs ONE LLM call so arbitrary paper titles like "3. Our Proposed Architecture"
-    # get mapped correctly instead of falling through keyword matching.
     document = normalize_section_headings(document)
-    # Pre-build all PaperChunks and store them on the document for downstream use.
     chunks = build_all_chunks(document)
     document = document.model_copy(update={"chunks": chunks})
     return {
@@ -271,21 +243,6 @@ def citation_expert_node(state: EvaluatorState) -> EvaluatorState:
     }
 
 
-# ---------------------------------------------------------------------------
-# Evidence retrieval node — the new agentic heart of the pipeline
-#
-# Routing logic:
-#   external_factcheck  → retrieve + verify (with one retry if evidence is weak)
-#   consistency_only    → skip retrieval (handled by existing consistency agent)
-#   skip                → no retrieval
-#
-# Retry loop (minimal agentic behaviour):
-#   1. Retrieve and verify.
-#   2. If verdict is insufficient/paper-only AND claim is high-importance → retry once
-#      with a reformulated broader query.
-#   3. Prefer the retry result only if it gives a more decisive verdict.
-# ---------------------------------------------------------------------------
-
 def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
     claims = state.get("claims", [])
     document = state["document"]
@@ -308,7 +265,6 @@ def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
             routing_log.append(log_entry)
             continue
 
-        # Build queries and retrieve evidence.
         queries = build_queries(claim, paper_title=paper_title)
         log_entry["queries"] = queries
 
@@ -319,14 +275,11 @@ def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
         )
         ranked_evidence = rank_evidence(claim, raw_evidence, top_k=_VERIFIER_TOP_K)
 
-        # Paper-local context for verifier grounding (bounded).
         paper_context = _paper_context_for_claim(document, claim)
 
-        # First verification pass.
         result = verify_claim(claim, paper_context=paper_context, evidence_items=ranked_evidence)
         log_entry["verdict_pass1"] = result.verdict
 
-        # Agentic retry: if evidence is weak and claim is high-importance, try once more.
         if should_retry(result, claim):
             retry_query = build_retry_query(claim, paper_title=paper_title)
             log_entry["retry_query"] = retry_query
@@ -343,7 +296,6 @@ def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
                     evidence_items=retry_ranked,
                 )
                 log_entry["verdict_pass2"] = retry_result.verdict
-                # Prefer retry if it gives a more informative verdict.
                 _WEAK = {"insufficient_evidence", "paper_supported_only"}
                 if result.verdict in _WEAK and retry_result.verdict not in _WEAK:
                     result = retry_result
@@ -371,13 +323,6 @@ def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
 
 
 def factcheck_expert_node(state: EvaluatorState) -> EvaluatorState:
-    """
-    Internal fact-check agent.
-
-    If evidence_results are available (v2), convert them to the legacy FactCheckResult
-    so all downstream agents and the report builder receive a consistent interface.
-    Fall back to the original internal LLM fact-checker if no evidence results exist.
-    """
     evidence_results = state.get("evidence_results") or []
     if evidence_results:
         factcheck = evidence_factcheck_to_legacy(evidence_results)
@@ -479,10 +424,6 @@ def report_builder_node(state: EvaluatorState) -> EvaluatorState:
     return {"report": report, "report_path": str(report_path)}
 
 
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
-
 def build_graph():
     workflow = StateGraph(EvaluatorState)
 
@@ -493,7 +434,6 @@ def build_graph():
     workflow.add_node("consistency_expert", consistency_expert_node)
     workflow.add_node("grammar_expert", grammar_expert_node)
     workflow.add_node("citation_expert", citation_expert_node)
-    # New: evidence retrieval + verification with routing + retry
     workflow.add_node("evidence_retrieval", evidence_retrieval_node)
     workflow.add_node("factcheck_expert", factcheck_expert_node)
     workflow.add_node("novelty_expert", novelty_expert_node)
@@ -508,7 +448,6 @@ def build_graph():
     workflow.add_edge("extract_claims", "consistency_expert")
     workflow.add_edge("consistency_expert", "grammar_expert")
     workflow.add_edge("grammar_expert", "citation_expert")
-    # After citation, route claims to external retrieval before factcheck.
     workflow.add_edge("citation_expert", "evidence_retrieval")
     workflow.add_edge("evidence_retrieval", "factcheck_expert")
     workflow.add_edge("factcheck_expert", "novelty_expert")

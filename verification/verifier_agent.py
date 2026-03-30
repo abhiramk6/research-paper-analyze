@@ -10,20 +10,15 @@ from models.schema import Claim, EvidenceFactCheckItem, EvidenceItem
 
 logger = logging.getLogger(__name__)
 
-# Hard cap on the entire verifier prompt to respect the 16k token budget.
-# Prompt overhead + claim + context + evidence must all fit within this.
 VERIFIER_MAX_INPUT_TOKENS = 9_000
 
-# Verifier evidence context: max chars per snippet and max items forwarded.
 EVIDENCE_SNIPPET_CAP = 350
 MAX_EVIDENCE_ITEMS = 5
 
-# Paper-local context forwarded to the verifier for grounding.
 PAPER_CONTEXT_CAP = 1_200
 
 
 def _trim_evidence(items: list[EvidenceItem]) -> list[dict]:
-    """Trim evidence items to stay within token budget."""
     trimmed = []
     for item in items[:MAX_EVIDENCE_ITEMS]:
         trimmed.append(
@@ -88,15 +83,6 @@ def verify_claim(
     paper_context: str = "",
     evidence_items: list[EvidenceItem] | None = None,
 ) -> EvidenceFactCheckItem:
-    """
-    Verify a single claim against paper-local context and external evidence.
-
-    If no evidence is provided (stub or retrieval failed), returns
-    `paper_supported_only` rather than silently marking verified.
-
-    Token safety: the prompt is assembled from capped components and
-    checked before the LLM call. Falls back to a heuristic verdict on error.
-    """
     evidence_items = evidence_items or []
 
     if not evidence_items:
@@ -112,14 +98,12 @@ def verify_claim(
 
     prompt = _build_verifier_prompt(claim, paper_context, evidence_items)
 
-    # Enforce token budget before calling the LLM.
     if count_tokens(prompt) > VERIFIER_MAX_INPUT_TOKENS:
         logger.warning(
             "Verifier prompt for %s exceeds %d tokens — truncating evidence.",
             claim.claim_id,
             VERIFIER_MAX_INPUT_TOKENS,
         )
-        # Reduce evidence to 2 items and retry.
         prompt = _build_verifier_prompt(claim, paper_context, evidence_items[:2])
 
     fallback = {
@@ -135,7 +119,6 @@ def verify_claim(
     reasoning = str(result.get("reasoning", ""))
     used_ids = [str(eid) for eid in result.get("used_evidence_ids", [])]
 
-    # Build evidence_items list — only include items actually referenced.
     used_items = [e for e in evidence_items if e.evidence_id in used_ids] or evidence_items[:2]
 
     return EvidenceFactCheckItem(

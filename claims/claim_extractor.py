@@ -8,29 +8,26 @@ from chunker.token_chunker import CLAIM_CHUNK_TOKENS, build_all_chunks, count_to
 from models.schema import Claim, PaperChunk, PaperDocument, PaperSection
 
 
-# Sections whose content is worth extracting claims from.
 CLAIM_SECTIONS = (
     "abstract", "introduction", "method", "methodology",
     "results", "conclusion", "related work", "background",
     "experiments", "evaluation", "analysis",
 )
 
-# New typed claim taxonomy (v2) + legacy types (v1) for backward compatibility.
 _VALID_CLAIM_TYPES = frozenset(
-    [
+    {
         "benchmark_result",
         "prior_work_comparison",
         "factual_background",
         "methodology_assertion",
         "contribution_claim",
         "unsupported_general_statement",
-        # Legacy
         "contribution",
         "result",
         "novelty",
         "factual",
         "background",
-    ]
+    }
 )
 
 _IMPORTANCE_TYPES = frozenset(["benchmark_result", "result", "prior_work_comparison", "novelty"])
@@ -56,7 +53,6 @@ def _normalize_claim_type(value: str) -> str:
     v = value.strip().lower().replace(" ", "_")
     if v in _VALID_CLAIM_TYPES:
         return v
-    # Loose mapping for LLM variations.
     if "benchmark" in v or "metric" in v:
         return "benchmark_result"
     if "prior" in v or "comparison" in v or "baseline" in v:
@@ -172,13 +168,11 @@ def _local_claim_fallback(document: PaperDocument, starting_counter: int = 1) ->
 
 
 def _relevant_chunks(document: PaperDocument) -> list[PaperChunk]:
-    """Return pre-built chunks; fall back to building them if missing."""
     if document.chunks:
         return [
             chunk for chunk in document.chunks
             if any(name in chunk.section_name.lower() for name in CLAIM_SECTIONS)
         ]
-    # Build on demand if pipeline skipped chunk pre-build.
     all_chunks = build_all_chunks(document, max_tokens=CLAIM_CHUNK_TOKENS)
     return [
         chunk for chunk in all_chunks
@@ -187,24 +181,11 @@ def _relevant_chunks(document: PaperDocument) -> list[PaperChunk]:
 
 
 def extract_claims(document: PaperDocument) -> list[Claim]:
-    """
-    Extract claims chunk-by-chunk from the document.
-
-    Each claim gets:
-      - claim_id, text, claim_type (new taxonomy)
-      - source_section, source_chunk_id
-      - importance (high/medium/low)
-      - nearby_citations, cited_refs
-      - confidence
-
-    Falls back to heuristic extraction if LLM returns nothing.
-    """
     claims: list[Claim] = []
     counter = 1
     seen_texts: set[str] = set()
 
     for chunk in _relevant_chunks(document):
-        # Token-safe: each chunk is already bounded by CLAIM_CHUNK_TOKENS.
         prompt = _build_chunk_prompt(chunk)
         payload = call_llm_json(prompt, fallback={"claims": []})
         raw_claims = payload.get("claims", [])
@@ -220,7 +201,6 @@ def extract_claims(document: PaperDocument) -> list[Claim]:
             claim_type = _normalize_claim_type(str(item.get("claim_type", "unsupported_general_statement")))
             confidence = float(item.get("confidence") or 0.0)
 
-            # Filter noise: very low confidence and vague statement types.
             if claim_type == "unsupported_general_statement" and confidence < 0.5:
                 continue
             if confidence < 0.30:

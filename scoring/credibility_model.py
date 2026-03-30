@@ -17,7 +17,6 @@ from models.schema import (
 
 logger = logging.getLogger(__name__)
 
-# Default weights used when config/scoring.yaml is missing or unreadable.
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "contradicted_ratio": 0.35,
     "insufficient_evidence_ratio": 0.20,
@@ -87,14 +86,6 @@ def compute_credibility_breakdown(
     citation: CitationResult,
     grammar: GrammarResult,
 ) -> CredibilityBreakdown:
-    """
-    Compute an interpretable, feature-level credibility breakdown.
-
-    Every feature is a measurable signal, not a hidden heuristic.
-    The formula and weights are configurable via config/scoring.yaml.
-
-    Score is in [0, 100] where higher = more risk.
-    """
     weights = _get_weights()
     penalties = _get_penalties()
     bands = _get_bands()
@@ -108,29 +99,19 @@ def compute_credibility_breakdown(
 
     supported_ratio = supported / n
     contradicted_ratio = contradicted / n
-    insufficient_ratio = (insufficient + mixed * 0.5) / n  # mixed counts as partial insufficiency
+    insufficient_ratio = (insufficient + mixed * 0.5) / n
 
-    # Citation coverage: normalise to [0, 1].
     citation_coverage = min(1.0, citation.score / 100.0)
-
-    # Consistency penalty: how far below 100 the score is, normalised.
     consistency_penalty_norm = max(0.0, (100 - consistency.score) / 100.0)
-
-    # Parser uncertainty: fraction of claims with low confidence (< 0.5).
     low_conf_claims = sum(1 for c in claims if c.confidence < 0.5)
     parser_uncertainty = low_conf_claims / max(len(claims), 1)
-
-    # High-impact unverified count: claims marked high importance with no external support.
     high_impact_unverified = sum(
         1 for r in evidence_results
         if r.verdict in ("insufficient_evidence", "paper_supported_only")
         for c in claims
         if c.claim_id == r.claim_id and c.importance == "high"
     )
-    # Normalise to [0, 1]: 5 or more unverified high-impact claims = max penalty.
     high_impact_norm = min(1.0, high_impact_unverified / 5.0)
-
-    # Weighted base score.
     raw = (
         weights["contradicted_ratio"] * contradicted_ratio
         + weights["insufficient_evidence_ratio"] * insufficient_ratio
@@ -141,7 +122,6 @@ def compute_credibility_breakdown(
         + weights["high_impact_unverified"] * high_impact_norm
     )
 
-    # Hard penalties for severely weak signals.
     hard = 0.0
     if citation.score < penalties["citation_score_floor"]:
         hard += penalties["citation_floor_penalty"]
@@ -152,7 +132,6 @@ def compute_credibility_breakdown(
     if not evidence_results:
         hard += penalties["no_evidence_penalty"]
 
-    # Convert to 0–100 scale and apply hard penalties.
     final_score = max(0.0, min(100.0, raw * 100 + hard))
 
     score_breakdown = {

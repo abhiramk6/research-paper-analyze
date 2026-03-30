@@ -102,7 +102,6 @@ if st.button("Evaluate Paper", type="primary"):
             with st.spinner("Running agents... this usually takes 60–120 seconds."):
                 report, details = run_pipeline(url)
 
-            # Surface quota exhaustion prominently — shown before results so it's not missed.
             if is_quota_exhausted():
                 st.warning(
                     "⚠️ **Gemini API quota exhausted during this run.**\n\n"
@@ -132,7 +131,6 @@ if st.button("Evaluate Paper", type="primary"):
             st.subheader("Claims Extracted")
             st.dataframe(claims_to_df(details["claims"]), use_container_width=True)
 
-            # Evidence-backed fact-check results (v2)
             evidence_results = details.get("evidence_results", [])
             if evidence_results:
                 st.subheader("Evidence-Backed Fact-Check")
@@ -147,7 +145,6 @@ if st.button("Evaluate Paper", type="primary"):
                 st.subheader("Fact Check Log")
                 st.dataframe(factcheck_to_df(details["factcheck"]), use_container_width=True)
 
-            # Credibility breakdown (v2)
             breakdown = getattr(details["credibility"], "breakdown", None)
             if breakdown:
                 with st.expander("Credibility Score Breakdown (Interpretable)"):
