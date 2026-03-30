@@ -1,22 +1,21 @@
-from __future__ import annotations
-
 import logging
+import re
 from typing import Any
 
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from agents.assessment_synthesis_agent import run_assessment_synthesis_agent
 from agents.consistency_agent import run_consistency_agent
 from agents.credibility_agent import run_credibility_agent
 from agents.grammar_agent import run_grammar_agent
 from agents.novelty_agent import run_novelty_agent
-from aggregator.report_builder import build_report
 from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, build_all_chunks, chunk_all_sections
 from claims.claim_extractor import extract_claims
 from ingestion.downloader import resolve_pdf_input
 from parser.pdf_parser import parse_paper
-from reporter.report_writer import save_report
+from reporter.report_writer import build_report, save_report
 from retrieval.evidence_ranker import rank_evidence
 from retrieval.query_builder import build_query_plan
 from retrieval.retriever import EvidenceRetriever
@@ -41,7 +40,9 @@ class EvaluatorState(TypedDict, total=False):
     consistency: Any
     novelty: Any
     fabrication: Any
+    assessment: Any
     report: Any
+    recommendation: str
     report_path: str
     paper_id: str
     retrieval_log: list[dict[str, Any]]
@@ -64,6 +65,38 @@ def _merge_evidence(existing: list, incoming: list) -> list:
     for item in incoming:
         by_id[item.evidence_id] = item
     return list(by_id.values())
+
+
+def _risk_band(score: float) -> str:
+    if score < 34:
+        return "low"
+    if score < 67:
+        return "medium"
+    return "high"
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _is_self_evidence(document, item) -> bool:
+    normalized_title = _normalize_text(document.title)
+    evidence_title = _normalize_text(item.title)
+    evidence_url = item.url.lower()
+    source_url = document.source_url.lower()
+    if normalized_title and evidence_title and (
+        normalized_title in evidence_title or evidence_title in normalized_title
+    ):
+        return True
+    if source_url and source_url in evidence_url:
+        return True
+    if document.paper_id and document.paper_id.lower() in evidence_url:
+        return True
+    return False
+
+
+def _filter_self_evidence(document, items: list[Any]) -> list[Any]:
+    return [item for item in items if not _is_self_evidence(document, item)]
 
 
 def ingest_paper_node(state: EvaluatorState) -> EvaluatorState:
@@ -104,7 +137,11 @@ def evidence_node(state: EvaluatorState) -> EvaluatorState:
 
         query_plan = build_query_plan(claim, paper_title=document.title)
         raw_evidence = _RETRIEVER.retrieve_for_plan(query_plan)
-        ranked_evidence = rank_evidence(claim, raw_evidence, top_k=5)
+        ranked_evidence = rank_evidence(
+            claim,
+            _filter_self_evidence(document, raw_evidence),
+            top_k=5,
+        )
         result = verify_claim(
             claim,
             paper_context=_paper_context_for_claim(document, claim),
@@ -155,7 +192,7 @@ def novelty_node(state: EvaluatorState) -> EvaluatorState:
         query_plan = build_query_plan(claim, paper_title=document.title)
         ranked = rank_evidence(
             claim,
-            _RETRIEVER.retrieve_for_plan(query_plan),
+            _filter_self_evidence(document, _RETRIEVER.retrieve_for_plan(query_plan)),
             top_k=3,
         )
         novelty_evidence = _merge_evidence(novelty_evidence, ranked)
@@ -176,6 +213,41 @@ def fabrication_node(state: EvaluatorState) -> EvaluatorState:
     }
 
 
+def assessment_synthesis_node(state: EvaluatorState) -> EvaluatorState:
+    baseline_consistency = state["consistency"]
+    baseline_fabrication = state["fabrication"]
+    assessment = run_assessment_synthesis_agent(
+        document=state["document"],
+        claims=state.get("claims", []),
+        claim_checks=state.get("claim_checks", []),
+        consistency=baseline_consistency,
+        grammar=state["grammar"],
+        novelty=state["novelty"],
+        fabrication=baseline_fabrication,
+    )
+    calibrated_consistency = baseline_consistency.model_copy(
+        update={
+            "raw_score": baseline_consistency.score,
+            "score": assessment.consistency_score,
+            "reasoning": assessment.consistency_reasoning,
+        }
+    )
+    calibrated_fabrication = baseline_fabrication.model_copy(
+        update={
+            "raw_score": baseline_fabrication.score,
+            "score": assessment.fabrication_score,
+            "risk_band": _risk_band(assessment.fabrication_score),
+            "reasoning": assessment.fabrication_reasoning,
+        }
+    )
+    return {
+        "assessment": assessment,
+        "recommendation": assessment.recommendation,
+        "consistency": calibrated_consistency,
+        "fabrication": calibrated_fabrication,
+    }
+
+
 def report_builder_node(state: EvaluatorState) -> EvaluatorState:
     report = build_report(
         state["document"],
@@ -185,6 +257,7 @@ def report_builder_node(state: EvaluatorState) -> EvaluatorState:
         state["novelty"],
         state["fabrication"],
         state.get("claim_checks", []),
+        assessment=state.get("assessment"),
     )
     report_path = save_report(
         report=report,
@@ -195,6 +268,7 @@ def report_builder_node(state: EvaluatorState) -> EvaluatorState:
         novelty=state["novelty"],
         fabrication=state["fabrication"],
         paper_id=state["paper_id"],
+        assessment=state.get("assessment"),
     )
     return {"report": report, "report_path": str(report_path)}
 
@@ -209,6 +283,7 @@ def build_graph():
     workflow.add_node("evaluate_grammar", grammar_node)
     workflow.add_node("evaluate_novelty", novelty_node)
     workflow.add_node("evaluate_fabrication", fabrication_node)
+    workflow.add_node("synthesize_assessment", assessment_synthesis_node)
     workflow.add_node("build_report", report_builder_node)
 
     workflow.add_edge(START, "ingest_paper")
@@ -218,7 +293,8 @@ def build_graph():
     workflow.add_edge("evaluate_consistency", "evaluate_grammar")
     workflow.add_edge("evaluate_grammar", "evaluate_novelty")
     workflow.add_edge("evaluate_novelty", "evaluate_fabrication")
-    workflow.add_edge("evaluate_fabrication", "build_report")
+    workflow.add_edge("evaluate_fabrication", "synthesize_assessment")
+    workflow.add_edge("synthesize_assessment", "build_report")
     workflow.add_edge("build_report", END)
 
     return workflow.compile()
@@ -237,6 +313,7 @@ def run_pipeline(source: str) -> tuple:
         "grammar": final_state["grammar"],
         "novelty": final_state["novelty"],
         "fabrication": final_state["fabrication"],
+        "assessment": final_state.get("assessment"),
         "evidence_catalog": final_state.get("evidence_catalog", []),
         "retrieval_log": final_state.get("retrieval_log", []),
         "report_path": final_state["report_path"],

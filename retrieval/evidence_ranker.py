@@ -1,11 +1,10 @@
-from __future__ import annotations
-
 import re
 
 from models.schema import Claim, EvidenceItem
 
 
 _NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?(?:%|x|k|M|B)?\b")
+MIN_RETRIEVAL_SCORE = 0.2
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -54,8 +53,9 @@ def score_evidence_item(claim: Claim, item: EvidenceItem) -> float:
 def rank_evidence(claim: Claim, items: list[EvidenceItem], top_k: int = 5) -> list[EvidenceItem]:
     scored: list[EvidenceItem] = []
     for item in items:
-        scored.append(
-            item.model_copy(update={"retrieval_score": score_evidence_item(claim, item)})
-        )
+        score = score_evidence_item(claim, item)
+        if score < MIN_RETRIEVAL_SCORE:
+            continue
+        scored.append(item.model_copy(update={"retrieval_score": score}))
     scored.sort(key=lambda item: item.retrieval_score, reverse=True)
     return scored[:top_k]

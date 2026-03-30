@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import shutil
 from pathlib import Path
 
@@ -30,4 +28,3 @@ def clear_runtime_cache() -> list[str]:
             continue
 
     return removed
-

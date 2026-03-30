@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -89,6 +87,7 @@ class ConsistencyResult(BaseModel):
     reasoning: str
     grounded_claim_count: int = 0
     unresolved_claim_count: int = 0
+    raw_score: Optional[int] = None
 
 
 class GrammarResult(BaseModel):
@@ -121,6 +120,17 @@ class FabricationRiskResult(BaseModel):
     risk_factors: list[str]
     reasoning: str
     breakdown: FabricationBreakdown
+    raw_score: Optional[float] = None
+
+
+class AssessmentSynthesisResult(BaseModel):
+    consistency_score: int
+    fabrication_score: float
+    recommendation: Literal["Pass", "Borderline", "Fail"]
+    summary: str
+    key_findings: list[str] = Field(default_factory=list)
+    consistency_reasoning: str
+    fabrication_reasoning: str
 
 
 class FinalReport(BaseModel):

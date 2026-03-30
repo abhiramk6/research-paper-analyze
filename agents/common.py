@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from chunker.token_chunker import rolling_window_text, truncate_to_token_limit
 
 

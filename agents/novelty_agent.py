@@ -1,31 +1,7 @@
-from __future__ import annotations
-
 import json
 
-from agents.llm_client import call_llm_json
+from agents.llm_client import call_llm_json_checked
 from models.schema import Claim, EvidenceItem, NoveltyResult, PaperDocument
-
-
-def _fallback(contribution_claims: list[Claim], evidence_items: list[EvidenceItem]) -> dict:
-    if not contribution_claims:
-        return {
-            "rating": "Low",
-            "reasoning": "No concrete contribution claims were extracted, so novelty could not be justified.",
-            "supporting_evidence_ids": [],
-        }
-    if not evidence_items:
-        return {
-            "rating": "Low",
-            "reasoning": "No meaningful prior-work evidence was retrieved, so novelty is rated conservatively.",
-            "supporting_evidence_ids": [],
-        }
-    scholarly_hits = [item for item in evidence_items if item.domain_tier == "scholarly"]
-    rating = "Moderate" if scholarly_hits else "Low"
-    return {
-        "rating": rating,
-        "reasoning": "Novelty fallback used. Prior-work evidence exists but the structured novelty synthesis could not be completed reliably.",
-        "supporting_evidence_ids": [item.evidence_id for item in scholarly_hits[:3]],
-    }
 
 
 def run_novelty_agent(
@@ -33,13 +9,10 @@ def run_novelty_agent(
     contribution_claims: list[Claim],
     evidence_items: list[EvidenceItem],
 ) -> NoveltyResult:
-    if not contribution_claims or not evidence_items:
-        fallback = _fallback(contribution_claims, evidence_items)
-        return NoveltyResult(
-            rating=fallback["rating"],
-            reasoning=fallback["reasoning"],
-            supporting_evidence_ids=fallback["supporting_evidence_ids"],
-        )
+    if not contribution_claims:
+        raise ValueError("Novelty evaluation requires at least one contribution claim.")
+    if not evidence_items:
+        raise ValueError("Novelty evaluation requires retrieved prior-work evidence.")
 
     schema = {
         "rating": "High|Moderate|Low",
@@ -58,16 +31,28 @@ def run_novelty_agent(
         "High means the contribution appears materially distinct from retrieved prior work.\n"
         "Moderate means there may be differentiation but the evidence is incomplete or mixed.\n"
         "Low means the contribution is weakly differentiated or not well supported.\n"
+        "Return one JSON object only.\n"
+        "Use these exact keys: rating, reasoning, supporting_evidence_ids.\n"
+        "rating must be exactly one of High, Moderate, Low.\n"
+        "If no evidence IDs are directly used, return an empty list for supporting_evidence_ids.\n"
         f"Return valid JSON matching:\n{json.dumps(schema, indent=2)}\n\n"
         f"Input:\n{json.dumps(payload, indent=2)}"
     )
-    response = call_llm_json(prompt, fallback=_fallback(contribution_claims, evidence_items))
-    rating = str(response.get("rating", "Low"))
+    response = call_llm_json_checked(
+        prompt,
+        required_fields=["rating", "reasoning", "supporting_evidence_ids"],
+        nonempty_fields=["rating", "reasoning"],
+        enum_fields={"rating": {"High", "Moderate", "Low"}},
+    )
+    rating = str(response.get("rating", "")).strip()
     if rating not in {"High", "Moderate", "Low"}:
-        rating = "Low"
+        raise ValueError(f"Unexpected novelty rating: {rating!r}")
+    reasoning = str(response.get("reasoning", "")).strip()
+    if not reasoning:
+        raise ValueError("Novelty agent returned empty reasoning.")
     supporting_ids = [str(item) for item in response.get("supporting_evidence_ids", [])]
     return NoveltyResult(
         rating=rating,
-        reasoning=str(response.get("reasoning", "")),
+        reasoning=reasoning,
         supporting_evidence_ids=supporting_ids,
     )

@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 from models.schema import (
+    AssessmentSynthesisResult,
     Claim,
     ClaimCheckResult,
     ConsistencyResult,
@@ -10,7 +9,89 @@ from models.schema import (
     FinalReport,
     GrammarResult,
     NoveltyResult,
+    PaperDocument,
 )
+
+
+def _recommendation(
+    consistency: ConsistencyResult,
+    grammar: GrammarResult,
+    fabrication: FabricationRiskResult,
+) -> str:
+    if fabrication.risk_band == "high" or consistency.score < 34 or grammar.rating == "Low":
+        return "Fail"
+    if fabrication.risk_band == "medium" or consistency.score < 67:
+        return "Borderline"
+    return "Pass"
+
+
+def _build_summary(
+    document: PaperDocument,
+    claims: list[Claim],
+    claim_checks: list[ClaimCheckResult],
+    consistency: ConsistencyResult,
+    grammar: GrammarResult,
+    novelty: NoveltyResult,
+    fabrication: FabricationRiskResult,
+    recommendation: str,
+) -> str:
+    checked = len(claim_checks)
+    supported = sum(1 for item in claim_checks if item.verdict == "supported")
+    contradicted = sum(1 for item in claim_checks if item.verdict == "contradicted")
+    unresolved = sum(1 for item in claim_checks if item.verdict == "insufficient_evidence")
+    contribution_count = sum(1 for claim in claims if claim.claim_type == "contribution")
+    result_count = sum(1 for claim in claims if claim.claim_type in {"result", "comparison"})
+
+    return "\n".join(
+        [
+            f"This evaluator reviewed `{document.title}` using bounded claim extraction, external evidence retrieval, and grounded scoring.",
+            (
+                f"It extracted {len(claims)} claims ({contribution_count} contribution, "
+                f"{result_count} result/comparison) and externally checked {checked} of them."
+            ),
+            (
+                f"Evidence outcomes: {supported} supported, {contradicted} contradicted, "
+                f"{unresolved} insufficient-evidence."
+            ),
+            (
+                f"Consistency scored {consistency.score}/100, grammar was rated {grammar.rating}, "
+                f"novelty was rated {novelty.rating}, and fabrication risk was {fabrication.score:.1f}/100."
+            ),
+            f"Overall recommendation: **{recommendation}**.",
+        ]
+    )
+
+
+def build_report(
+    document: PaperDocument,
+    claims: list[Claim],
+    consistency: ConsistencyResult,
+    grammar: GrammarResult,
+    novelty: NoveltyResult,
+    fabrication: FabricationRiskResult,
+    claim_checks: list[ClaimCheckResult],
+    assessment: AssessmentSynthesisResult | None = None,
+) -> FinalReport:
+    recommendation = assessment.recommendation if assessment else _recommendation(consistency, grammar, fabrication)
+    summary = assessment.summary if assessment else _build_summary(
+        document,
+        claims,
+        claim_checks,
+        consistency,
+        grammar,
+        novelty,
+        fabrication,
+        recommendation,
+    )
+    return FinalReport(
+        title=document.title,
+        summary=summary,
+        consistency_score=consistency.score,
+        grammar_rating=grammar.rating,
+        novelty_rating=novelty.rating,
+        fabrication_risk=f"{round(fabrication.score)}% risk",
+        recommendation=recommendation,
+    )
 
 
 def _bullet_list(items: list[str], empty_message: str) -> str:
@@ -62,13 +143,18 @@ def _fabrication_section(fabrication: FabricationRiskResult) -> str:
         f"| {name.replace('_', ' ').title()} | {value:.2f} |"
         for name, value in breakdown.score_components.items()
     )
+    raw_score_line = (
+        f"**Raw Rule-Based Score:** {fabrication.raw_score:.1f}/100\n\n"
+        if fabrication.raw_score is not None else ""
+    )
     return (
         "## Fabrication Risk\n\n"
         f"**Score:** {fabrication.score:.1f}/100\n\n"
+        f"{raw_score_line}"
         f"**Band:** {fabrication.risk_band.upper()}\n\n"
         f"{fabrication.reasoning}\n\n"
         "### Score Components\n\n"
-        "| Component | Points |\n"
+        "| Component | Percent |\n"
         "|---|---|\n"
         f"{rows}\n\n"
         "### Risk Factors\n\n"
@@ -85,15 +171,28 @@ def save_report(
     novelty: NoveltyResult,
     fabrication: FabricationRiskResult,
     paper_id: str,
+    assessment: AssessmentSynthesisResult | None = None,
 ) -> Path:
     output_dir = Path("reports") / paper_id
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "report.md"
+    raw_consistency_line = (
+        f"**Raw Rule-Based Score:** {consistency.raw_score}/100\n"
+        if consistency.raw_score is not None else ""
+    )
+    key_findings_block = (
+        "## Key Findings\n"
+        + _bullet_list(assessment.key_findings, "No additional synthesis findings were recorded.")
+        + "\n\n"
+        if assessment and assessment.key_findings else ""
+    )
 
     content = f"""# Judgement Report: {report.title}
 
 ## Executive Summary
 {report.summary}
+
+{key_findings_block}
 
 ## Scores At A Glance
 | Metric | Value |
@@ -109,6 +208,8 @@ def save_report(
 
 ## Consistency Analysis
 **Score:** {report.consistency_score}/100
+
+{raw_consistency_line}
 
 {consistency.reasoning}
 

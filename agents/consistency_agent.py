@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from models.schema import Claim, ClaimCheckResult, ConsistencyResult, PaperDocument
 
 
@@ -33,31 +31,13 @@ def run_consistency_agent(
     )
 
     checked_count = len(checked_results)
-    contradicted_ratio = len(contradicted) / max(checked_count, 1)
-    mixed_ratio = len(mixed) / max(checked_count, 1)
-    unresolved_ratio = len(unresolved) / max(checked_count, 1)
-    grounded_ratio = len(grounded) / max(checked_count, 1)
-
-    score = 100.0
-    score -= contradicted_ratio * 45
-    score -= mixed_ratio * 24
-    score -= unresolved_ratio * 18
-    if not method_claims and not method_sections_present:
-        score -= 12
-    if not result_claims:
-        score -= 10
-    if checked_count and not grounded:
-        score -= 18
-    elif checked_count and grounded_ratio < 0.34:
-        score -= 5
-    if checked_count >= 3 and unresolved_ratio >= 0.75:
-        score -= 8
-
-    score_int = max(0, min(100, round(score)))
+    support_units = len(grounded) + (0.5 * len(mixed))
+    score_int = round(100 * support_units / max(len(result_claims), 1))
+    score_int = max(0, min(100, score_int))
 
     issues: list[str] = []
     if not method_claims and not method_sections_present:
-        issues.append("The parsed paper does not expose a clear method signal to support the reported outcomes.")
+        issues.append("The parsed paper does not expose a clear method signal, so result interpretation is weaker.")
     if not result_claims:
         issues.append("Few concrete result or comparison claims were extracted, so consistency is hard to judge.")
     if contradicted:
@@ -66,11 +46,13 @@ def run_consistency_agent(
         issues.append(f"{len(mixed)} checked claim(s) had mixed support and contradiction signals.")
     if unresolved:
         issues.append(f"{len(unresolved)} checked claim(s) could not be tied to strong external evidence.")
-    if checked_count and not grounded:
-        issues.append("None of the externally checked result/comparison claims received strong support.")
+    missing_checks = len(result_claims) - checked_count
+    if missing_checks > 0:
+        issues.append(f"{missing_checks} result-like claim(s) were extracted but never completed external checking.")
 
     reasoning = (
-        "Consistency is computed from grounded claim evidence rather than a free-form score. "
+        "Consistency is the percentage of extracted result/comparison/factual claims that received grounded support, "
+        "with mixed verdicts counting as partial support. "
         f"{len(grounded)} checked result/comparison claim(s) were supported, "
         f"{len(contradicted)} contradicted, {len(mixed)} mixed, and {len(unresolved)} unresolved. "
         f"Method signals were {'present' if method_claims or method_sections_present else 'not clearly present'}."
@@ -81,5 +63,5 @@ def run_consistency_agent(
         issues=issues,
         reasoning=reasoning,
         grounded_claim_count=len(grounded),
-        unresolved_claim_count=len(unresolved) + len(contradicted) + len(mixed),
+        unresolved_claim_count=max(len(result_claims) - len(grounded), 0),
     )

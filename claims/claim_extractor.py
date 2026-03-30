@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 import json
 import re
 
-from agents.llm_client import call_llm_json
-from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, build_all_chunks, count_tokens, truncate_to_token_limit
+from agents.llm_client import call_llm_json_checked
+from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, build_all_chunks, truncate_to_token_limit
 from models.schema import Claim, PaperChunk, PaperDocument
 
 
@@ -84,61 +82,13 @@ def _claim_prompt(chunk: PaperChunk) -> str:
         "- Skip generic hype or vague claims.\n"
         "- Keep nearby citations when visible.\n"
         "- Confidence must be in [0, 1].\n"
+        "- Return one JSON object only.\n"
+        "- Use the exact top-level key claims.\n"
+        "- If no valid claims are present in the window, return {\"claims\": []}.\n"
         f"Respond with valid JSON matching:\n{json.dumps(schema, indent=2)}\n\n"
         f"Window metadata: section={chunk.section_name}, chunk_id={chunk.chunk_id}\n\n"
         f"{content}"
     )
-
-
-def _local_fallback(document: PaperDocument, start_index: int) -> list[Claim]:
-    fallback: list[Claim] = []
-    signal_words = (
-        "we propose",
-        "we introduce",
-        "we present",
-        "outperform",
-        "improve",
-        "achieve",
-        "state-of-the-art",
-        "%",
-        "compared to",
-        "baseline",
-        "dataset",
-    )
-    chunks = document.chunks or build_all_chunks(document, max_tokens=EXTRACTION_WINDOW_TOKENS)
-    for chunk in chunks:
-        sentences = re.split(r"(?<=[.!?])\s+", chunk.content)
-        for sentence in sentences:
-            clean = _normalize_spaces(sentence)
-            if len(clean.split()) < 8:
-                continue
-            if not any(token in clean.lower() for token in signal_words):
-                continue
-            if len(fallback) >= 6:
-                return fallback
-            claim_type = "contribution"
-            lowered = clean.lower()
-            if any(token in lowered for token in ("outperform", "baseline", "compared to")):
-                claim_type = "comparison"
-            elif any(token in lowered for token in ("achieve", "accuracy", "score", "%", "state-of-the-art")):
-                claim_type = "result"
-            elif any(token in lowered for token in ("dataset", "corpus", "benchmark")):
-                claim_type = "factual"
-            elif any(token in lowered for token in ("architecture", "layer", "attention", "training")):
-                claim_type = "method"
-            fallback.append(
-                Claim(
-                    claim_id=f"claim_{start_index + len(fallback)}",
-                    text=clean[:500],
-                    claim_type=claim_type,
-                    source_section=chunk.section_name,
-                    source_chunk_id=chunk.chunk_id,
-                    importance=_infer_importance(claim_type, clean, 0.45),
-                    nearby_citations=_extract_citations(clean),
-                    confidence=0.45,
-                )
-            )
-    return fallback
 
 
 def extract_claims(document: PaperDocument) -> list[Claim]:
@@ -147,8 +97,10 @@ def extract_claims(document: PaperDocument) -> list[Claim]:
     seen_texts: set[str] = set()
 
     for chunk in chunks:
-        prompt = _claim_prompt(chunk)
-        payload = call_llm_json(prompt, fallback={"claims": []})
+        payload = call_llm_json_checked(
+            _claim_prompt(chunk),
+            required_fields=["claims"],
+        )
         for raw in payload.get("claims", []):
             text = _normalize_spaces(str(raw.get("text", "")))
             if not text or len(text.split()) < 6:
@@ -187,6 +139,6 @@ def extract_claims(document: PaperDocument) -> list[Claim]:
             if len(claims) >= MAX_CLAIMS:
                 return claims
 
-    if claims:
-        return claims
-    return _local_fallback(document, start_index=1)
+    if not claims:
+        raise ValueError("Claim extraction produced no usable claims.")
+    return claims

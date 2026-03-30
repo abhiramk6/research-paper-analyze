@@ -1,18 +1,14 @@
-from __future__ import annotations
-
 import hashlib
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from models.schema import EvidenceItem
 
 
 logger = logging.getLogger(__name__)
-_MISSING_DDG_WARNED = False
 
 DEFAULT_SNIPPET_MAX_CHARS = 350
 SCHOLARLY_DOMAINS = (
@@ -30,15 +26,32 @@ SCHOLARLY_DOMAINS = (
     "papers.nips.cc",
 )
 
+BLOCKED_DOMAINS = (
+    "baidu.com",
+    "zhidao.baidu.com",
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "pinterest.com",
+    "quora.com",
+)
+
+BLOCKED_TITLE_TERMS = (
+    "lyrics",
+    "song",
+    "mp3",
+    "torrent",
+    "百度",
+)
+
 
 def _load_retrieval_config() -> dict:
     config_path = Path(__file__).parent.parent / "config" / "retrieval.yaml"
-    try:
-        import yaml  # type: ignore[import]
+    import yaml  # type: ignore[import]
 
-        return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing retrieval config: {config_path}")
+    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 
 
 _RETRIEVAL_CONFIG = _load_retrieval_config()
@@ -79,51 +92,67 @@ def domain_tier(url: str) -> str:
     return "scholarly" if any(domain.endswith(token) for token in SCHOLARLY_DOMAINS) else "web"
 
 
-class DuckDuckGoRetriever:
+def _normalized_url(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc.lower(), parsed.path, "", "", ""))
+
+
+def _is_blocked_result(title: str, url: str, snippet: str) -> bool:
+    domain = _domain_from_url(url)
+    lowered_title = title.lower()
+    lowered_snippet = snippet.lower()
+    if any(domain.endswith(token) for token in BLOCKED_DOMAINS):
+        return True
+    if any(term in lowered_title or term in lowered_snippet for term in BLOCKED_TITLE_TERMS):
+        return True
+    return False
+
+
+class DDGSRetriever:
     def retrieve(self, query: str, max_results: int = MAX_RESULTS_PER_QUERY) -> list[EvidenceItem]:
-        global _MISSING_DDG_WARNED
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
         except ImportError:
-            if not _MISSING_DDG_WARNED:
-                logger.warning("duckduckgo_search not installed; external retrieval disabled.")
-                _MISSING_DDG_WARNED = True
-            return []
+            raise RuntimeError("ddgs is not installed; external retrieval is unavailable.")
 
         items: list[EvidenceItem] = []
-        try:
-            time.sleep(0.35)
-            with DDGS() as ddgs:
-                for index, result in enumerate(ddgs.text(query, max_results=max_results)):
-                    url = result.get("href") or ""
-                    domain = _domain_from_url(url)
-                    items.append(
-                        EvidenceItem(
-                            evidence_id=_make_evidence_id(url or query, index),
-                            query=query,
-                            title=(result.get("title") or "")[:140],
-                            url=url,
-                            domain=domain,
-                            domain_tier=domain_tier(url),
-                            snippet=(result.get("body") or "")[:SNIPPET_MAX_CHARS],
-                            retrieval_score=0.0,
-                        )
+        time.sleep(0.35)
+        with DDGS() as ddgs:
+            next_index = 0
+            for result in ddgs.text(query, max_results=max_results):
+                url = result.get("href") or ""
+                title = (result.get("title") or "")[:140]
+                snippet = (result.get("body") or "")[:SNIPPET_MAX_CHARS]
+                if not url or _is_blocked_result(title, url, snippet):
+                    continue
+                domain = _domain_from_url(url)
+                items.append(
+                    EvidenceItem(
+                        evidence_id=_make_evidence_id(url or query, next_index),
+                        query=query,
+                        title=title,
+                        url=url,
+                        domain=domain,
+                        domain_tier=domain_tier(url),
+                        snippet=snippet,
+                        retrieval_score=0.0,
                     )
-        except Exception as exc:
-            logger.warning("Retrieval failed for query %r: %s", query[:80], exc)
+                )
+                next_index += 1
+                if len(items) >= max_results:
+                    break
         return items
 
 
 class EvidenceRetriever:
     def __init__(self, backend: RetrieverProtocol | None = None) -> None:
         retrieval_enabled = _config_bool("enable_web_retrieval", True)
-        disabled_via_env = os.getenv("DISABLE_WEB_RETRIEVAL", "").lower() in {"1", "true", "yes"}
         if backend is not None:
             self._backend = backend
-        elif retrieval_enabled and not disabled_via_env:
-            self._backend = DuckDuckGoRetriever()
+        elif retrieval_enabled:
+            self._backend = DDGSRetriever()
         else:
-            self._backend = None
+            raise RuntimeError("External retrieval is disabled in config.")
 
     def retrieve_for_plan(
         self,
@@ -131,16 +160,13 @@ class EvidenceRetriever:
         max_per_query: int = MAX_RESULTS_PER_QUERY,
         global_cap: int = GLOBAL_EVIDENCE_CAP,
     ) -> list[EvidenceItem]:
-        if self._backend is None:
-            return []
-
         merged: list[EvidenceItem] = []
         seen_urls: set[str] = set()
 
         def collect(queries: list[str]) -> None:
             for query in queries:
                 for item in self._backend.retrieve(query, max_results=max_per_query):
-                    dedupe_key = item.url or f"{item.title}:{item.snippet}"
+                    dedupe_key = _normalized_url(item.url) or f"{item.title}:{item.snippet}"
                     if dedupe_key in seen_urls:
                         continue
                     seen_urls.add(dedupe_key)

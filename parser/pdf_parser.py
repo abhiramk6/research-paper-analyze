@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import re
 from pathlib import Path
 
@@ -211,7 +209,21 @@ def parse_paper(pdf_path: str | Path, source_url: str = "") -> PaperDocument:
     title = _extract_title(path, lines)
     abstract, sections, references = _split_sections(lines)
     if not sections:
-        raise ValueError("No sections could be extracted from the PDF")
+        sections = [
+            PaperSection(
+                section_id="sec_1",
+                heading="Body",
+                content="\n".join(lines),
+            )
+        ]
+    elif len(sections) == 1 and sections[0].heading == "Front Matter":
+        sections = [
+            PaperSection(
+                section_id="sec_1",
+                heading="Body",
+                content=sections[0].content,
+            )
+        ]
 
     return PaperDocument(
         paper_id=path.stem,

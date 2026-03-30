@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import json
 import logging
 
-from agents.llm_client import call_llm_json
+from agents.llm_client import call_llm_json_checked
 from chunker.token_chunker import VERIFIER_MAX_INPUT_TOKENS, count_tokens, truncate_to_token_limit
 from models.schema import Claim, ClaimCheckResult, EvidenceItem
 
@@ -52,11 +50,19 @@ def _build_prompt(claim: Claim, paper_context: str, evidence_items: list[Evidenc
     return (
         "You are verifying a research-paper claim using the paper text and retrieved external evidence.\n\n"
         "Be conservative.\n"
+        "- The paper_context is only for interpreting what the authors are claiming.\n"
+        "- Do not treat the paper_context by itself as verification.\n"
+        "- A claim can be supported only if the external evidence corroborates it.\n"
+        "- If external evidence is weak, missing, or only restates the same paper, return insufficient_evidence.\n"
         "- supported: the evidence clearly corroborates the claim\n"
         "- contradicted: the evidence clearly conflicts with the claim\n"
         "- mixed: some evidence supports and some conflicts\n"
         "- insufficient_evidence: evidence is too weak, indirect, or absent\n"
         "- Only cite evidence IDs you actually used.\n"
+        "- Return one JSON object only.\n"
+        "- Use these exact keys: verdict, confidence, reasoning, matched_evidence_ids.\n"
+        "- verdict must be exactly one of supported, contradicted, mixed, insufficient_evidence.\n"
+        "- If no evidence IDs are directly used, return an empty list for matched_evidence_ids.\n"
         f"Return valid JSON matching this schema:\n{json.dumps(schema, indent=2)}\n\n"
         f"Input:\n{json.dumps(payload, indent=2)}"
     )
@@ -83,24 +89,26 @@ def verify_claim(
         logger.warning("Verifier prompt exceeded budget for %s; trimming evidence.", claim.claim_id)
         prompt = _build_prompt(claim, paper_context, evidence_items[:2])
 
-    fallback = {
-        "verdict": "insufficient_evidence",
-        "confidence": 0.2,
-        "reasoning": "The verifier could not produce a reliable structured judgement.",
-        "matched_evidence_ids": [],
-    }
-    payload = call_llm_json(prompt, fallback=fallback)
-    verdict = str(payload.get("verdict", "insufficient_evidence")).strip().lower()
+    payload = call_llm_json_checked(
+        prompt,
+        required_fields=["verdict", "confidence", "reasoning", "matched_evidence_ids"],
+        nonempty_fields=["verdict", "reasoning"],
+        enum_fields={"verdict": {"supported", "contradicted", "mixed", "insufficient_evidence"}},
+    )
+    verdict = str(payload.get("verdict", "")).strip().lower()
     if verdict not in {"supported", "contradicted", "mixed", "insufficient_evidence"}:
-        verdict = "insufficient_evidence"
+        raise ValueError(f"Unexpected verifier verdict: {verdict!r}")
     matched_ids = [str(item) for item in payload.get("matched_evidence_ids", [])]
     used_items = [item for item in evidence_items if item.evidence_id in matched_ids] or evidence_items[:2]
+    reasoning = str(payload.get("reasoning", "")).strip()
+    if not reasoning:
+        raise ValueError("Verifier returned empty reasoning.")
 
     return ClaimCheckResult(
         claim_id=claim.claim_id,
         verdict=verdict,
         confidence=round(float(payload.get("confidence") or 0.0), 3),
-        reasoning=str(payload.get("reasoning", "")),
+        reasoning=reasoning,
         matched_evidence_ids=matched_ids,
         paper_context_excerpt=truncate_to_token_limit(paper_context, PAPER_CONTEXT_CAP),
         evidence_items=used_items,

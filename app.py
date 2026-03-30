@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pandas as pd
@@ -107,7 +105,7 @@ if st.button("Evaluate Paper", type="primary"):
 
             if is_quota_exhausted():
                 st.warning(
-                    "Gemini quota was exhausted during part of this run, so some structured outputs may have used conservative fallbacks.\n\n"
+                    "Gemini quota was exhausted during part of this run.\n\n"
                     f"Detail: {get_quota_error_message()}"
                 )
 
