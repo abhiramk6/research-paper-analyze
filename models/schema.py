@@ -39,13 +39,6 @@ class PaperDocument(BaseModel):
 
 ClaimType = Literal["contribution", "result", "comparison", "factual", "method"]
 ClaimImportance = Literal["high", "medium", "low"]
-ClaimStatus = Literal[
-    "unverified",
-    "supported",
-    "contradicted",
-    "mixed",
-    "insufficient_evidence",
-]
 
 
 class Claim(BaseModel):
@@ -57,7 +50,6 @@ class Claim(BaseModel):
     importance: ClaimImportance = "medium"
     nearby_citations: list[str] = Field(default_factory=list)
     confidence: float = 0.0
-    verification_status: ClaimStatus = "unverified"
 
 
 class EvidenceItem(BaseModel):

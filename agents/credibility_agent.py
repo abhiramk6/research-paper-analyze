@@ -2,7 +2,7 @@ from models.schema import Claim, ClaimCheckResult, ConsistencyResult, Fabricatio
 from scoring.credibility_model import compute_fabrication_breakdown
 
 
-def _risk_band(score: float) -> str:
+def risk_band(score: float) -> str:
     if score < 34:
         return "low"
     if score < 67:
@@ -24,7 +24,7 @@ def run_credibility_agent(
         consistency=consistency,
     )
     score = breakdown.final_score
-    band = _risk_band(score)
+    band = risk_band(score)
 
     risk_factors: list[str] = []
     if breakdown.contradicted_ratio > 0:

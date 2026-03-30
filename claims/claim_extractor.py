@@ -2,7 +2,7 @@ import json
 import re
 
 from agents.llm_client import call_llm_json_checked
-from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, build_all_chunks, truncate_to_token_limit
+from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, truncate_to_token_limit
 from models.schema import Claim, PaperChunk, PaperDocument
 
 
@@ -92,7 +92,7 @@ def _claim_prompt(chunk: PaperChunk) -> str:
 
 
 def extract_claims(document: PaperDocument) -> list[Claim]:
-    chunks = document.chunks or build_all_chunks(document, max_tokens=EXTRACTION_WINDOW_TOKENS)
+    chunks = document.chunks
     claims: list[Claim] = []
     seen_texts: set[str] = set()
 

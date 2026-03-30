@@ -6,7 +6,6 @@ from models.schema import PaperChunk, PaperDocument, PaperSection
 
 
 MAX_LLM_TOKENS = 16_000
-DEFAULT_SAFETY_MARGIN = 1_000
 DEFAULT_WINDOW_TOKENS = 5_000
 DEFAULT_OVERLAP_TOKENS = 500
 GRAMMAR_SAMPLE_TOKENS = 3_500
@@ -160,24 +159,3 @@ def build_all_chunks(
                 )
             )
     return chunks
-
-
-def build_context_bundle(
-    chunks: list[PaperChunk],
-    max_tokens: int,
-    heading_filter: set[str] | None = None,
-) -> str:
-    selected: list[str] = []
-    for chunk in chunks:
-        if heading_filter and chunk.section_name.lower() not in heading_filter:
-            continue
-        entry = f"[{chunk.section_name} | {chunk.chunk_id}]\n{chunk.content}".strip()
-        candidate = "\n\n".join(selected + [entry]).strip()
-        if selected and count_tokens(candidate) > max_tokens:
-            break
-        selected.append(entry)
-    return "\n\n".join(selected).strip()
-
-
-def safe_prompt_room(max_prompt_tokens: int = MAX_LLM_TOKENS) -> int:
-    return max(1_000, max_prompt_tokens - DEFAULT_SAFETY_MARGIN)

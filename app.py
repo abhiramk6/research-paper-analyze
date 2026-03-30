@@ -67,7 +67,7 @@ def retrieval_log_to_df(retrieval_log: list) -> pd.DataFrame:
                 "Claim ID": item.get("claim_id", ""),
                 "Type": item.get("claim_type", ""),
                 "Routing": item.get("routing_decision", ""),
-                "Retrieved": item.get("retrieved_count", "—"),
+                "Retrieved": str(item.get("retrieved_count", "—")),
                 "Verdict": item.get("final_verdict", "—"),
             }
             for item in retrieval_log

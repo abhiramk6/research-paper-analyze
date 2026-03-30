@@ -2,8 +2,9 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Protocol
 from urllib.parse import urlparse, urlunparse
+
+import yaml
 
 from models.schema import EvidenceItem
 
@@ -47,8 +48,6 @@ BLOCKED_TITLE_TERMS = (
 
 def _load_retrieval_config() -> dict:
     config_path = Path(__file__).parent.parent / "config" / "retrieval.yaml"
-    import yaml  # type: ignore[import]
-
     if not config_path.exists():
         raise FileNotFoundError(f"Missing retrieval config: {config_path}")
     return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -71,11 +70,6 @@ def _config_bool(key: str, default: bool) -> bool:
 MAX_RESULTS_PER_QUERY = _config_int("max_results_per_query", 5)
 GLOBAL_EVIDENCE_CAP = _config_int("global_evidence_cap", 10)
 SNIPPET_MAX_CHARS = _config_int("snippet_max_chars", DEFAULT_SNIPPET_MAX_CHARS)
-
-
-class RetrieverProtocol(Protocol):
-    def retrieve(self, query: str, max_results: int = MAX_RESULTS_PER_QUERY) -> list[EvidenceItem]:
-        ...
 
 
 def _make_evidence_id(source: str, index: int) -> str:
@@ -145,7 +139,7 @@ class DDGSRetriever:
 
 
 class EvidenceRetriever:
-    def __init__(self, backend: RetrieverProtocol | None = None) -> None:
+    def __init__(self, backend: "DDGSRetriever | None" = None) -> None:
         retrieval_enabled = _config_bool("enable_web_retrieval", True)
         if backend is not None:
             self._backend = backend

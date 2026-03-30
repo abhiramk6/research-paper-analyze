@@ -8,7 +8,7 @@ from typing_extensions import TypedDict
 
 from agents.assessment_synthesis_agent import run_assessment_synthesis_agent
 from agents.consistency_agent import run_consistency_agent
-from agents.credibility_agent import run_credibility_agent
+from agents.credibility_agent import risk_band, run_credibility_agent
 from agents.grammar_agent import run_grammar_agent
 from agents.novelty_agent import run_novelty_agent
 from chunker.token_chunker import DEFAULT_WINDOW_TOKENS, build_all_chunks, chunk_all_sections
@@ -19,7 +19,6 @@ from reporter.report_writer import build_report, save_report
 from retrieval.evidence_ranker import rank_evidence
 from retrieval.query_builder import build_query_plan
 from retrieval.retriever import EvidenceRetriever
-from verification.claim_router import routing_decision
 from verification.verifier_agent import verify_claim
 
 
@@ -27,6 +26,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _RETRIEVER = EvidenceRetriever()
+_EXTERNAL_CLAIM_TYPES = frozenset({"result", "comparison", "factual"})
 
 
 class EvaluatorState(TypedDict, total=False):
@@ -65,14 +65,6 @@ def _merge_evidence(existing: list, incoming: list) -> list:
     for item in incoming:
         by_id[item.evidence_id] = item
     return list(by_id.values())
-
-
-def _risk_band(score: float) -> str:
-    if score < 34:
-        return "low"
-    if score < 67:
-        return "medium"
-    return "high"
 
 
 def _normalize_text(value: str) -> str:
@@ -124,14 +116,14 @@ def evidence_node(state: EvaluatorState) -> EvaluatorState:
     evidence_catalog: list[Any] = []
 
     for claim in claims:
-        decision = routing_decision(claim)
+        is_external = claim.claim_type in _EXTERNAL_CLAIM_TYPES
         log_entry: dict[str, Any] = {
             "claim_id": claim.claim_id,
             "claim_type": claim.claim_type,
             "importance": claim.importance,
-            "routing_decision": decision,
+            "routing_decision": "external_evidence" if is_external else "internal_only",
         }
-        if decision != "external_evidence":
+        if not is_external:
             retrieval_log.append(log_entry)
             continue
 
@@ -236,7 +228,7 @@ def assessment_synthesis_node(state: EvaluatorState) -> EvaluatorState:
         update={
             "raw_score": baseline_fabrication.score,
             "score": assessment.fabrication_score,
-            "risk_band": _risk_band(assessment.fabrication_score),
+            "risk_band": risk_band(assessment.fabrication_score),
             "reasoning": assessment.fabrication_reasoning,
         }
     )
@@ -251,13 +243,11 @@ def assessment_synthesis_node(state: EvaluatorState) -> EvaluatorState:
 def report_builder_node(state: EvaluatorState) -> EvaluatorState:
     report = build_report(
         state["document"],
-        state.get("claims", []),
         state["consistency"],
         state["grammar"],
         state["novelty"],
         state["fabrication"],
-        state.get("claim_checks", []),
-        assessment=state.get("assessment"),
+        state["assessment"],
     )
     report_path = save_report(
         report=report,
@@ -268,7 +258,7 @@ def report_builder_node(state: EvaluatorState) -> EvaluatorState:
         novelty=state["novelty"],
         fabrication=state["fabrication"],
         paper_id=state["paper_id"],
-        assessment=state.get("assessment"),
+        assessment=state["assessment"],
     )
     return {"report": report, "report_path": str(report_path)}
 

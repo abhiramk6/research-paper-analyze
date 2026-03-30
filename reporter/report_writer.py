@@ -13,84 +13,22 @@ from models.schema import (
 )
 
 
-def _recommendation(
-    consistency: ConsistencyResult,
-    grammar: GrammarResult,
-    fabrication: FabricationRiskResult,
-) -> str:
-    if fabrication.risk_band == "high" or consistency.score < 34 or grammar.rating == "Low":
-        return "Fail"
-    if fabrication.risk_band == "medium" or consistency.score < 67:
-        return "Borderline"
-    return "Pass"
-
-
-def _build_summary(
-    document: PaperDocument,
-    claims: list[Claim],
-    claim_checks: list[ClaimCheckResult],
-    consistency: ConsistencyResult,
-    grammar: GrammarResult,
-    novelty: NoveltyResult,
-    fabrication: FabricationRiskResult,
-    recommendation: str,
-) -> str:
-    checked = len(claim_checks)
-    supported = sum(1 for item in claim_checks if item.verdict == "supported")
-    contradicted = sum(1 for item in claim_checks if item.verdict == "contradicted")
-    unresolved = sum(1 for item in claim_checks if item.verdict == "insufficient_evidence")
-    contribution_count = sum(1 for claim in claims if claim.claim_type == "contribution")
-    result_count = sum(1 for claim in claims if claim.claim_type in {"result", "comparison"})
-
-    return "\n".join(
-        [
-            f"This evaluator reviewed `{document.title}` using bounded claim extraction, external evidence retrieval, and grounded scoring.",
-            (
-                f"It extracted {len(claims)} claims ({contribution_count} contribution, "
-                f"{result_count} result/comparison) and externally checked {checked} of them."
-            ),
-            (
-                f"Evidence outcomes: {supported} supported, {contradicted} contradicted, "
-                f"{unresolved} insufficient-evidence."
-            ),
-            (
-                f"Consistency scored {consistency.score}/100, grammar was rated {grammar.rating}, "
-                f"novelty was rated {novelty.rating}, and fabrication risk was {fabrication.score:.1f}/100."
-            ),
-            f"Overall recommendation: **{recommendation}**.",
-        ]
-    )
-
-
 def build_report(
     document: PaperDocument,
-    claims: list[Claim],
     consistency: ConsistencyResult,
     grammar: GrammarResult,
     novelty: NoveltyResult,
     fabrication: FabricationRiskResult,
-    claim_checks: list[ClaimCheckResult],
-    assessment: AssessmentSynthesisResult | None = None,
+    assessment: AssessmentSynthesisResult,
 ) -> FinalReport:
-    recommendation = assessment.recommendation if assessment else _recommendation(consistency, grammar, fabrication)
-    summary = assessment.summary if assessment else _build_summary(
-        document,
-        claims,
-        claim_checks,
-        consistency,
-        grammar,
-        novelty,
-        fabrication,
-        recommendation,
-    )
     return FinalReport(
         title=document.title,
-        summary=summary,
+        summary=assessment.summary,
         consistency_score=consistency.score,
         grammar_rating=grammar.rating,
         novelty_rating=novelty.rating,
         fabrication_risk=f"{round(fabrication.score)}% risk",
-        recommendation=recommendation,
+        recommendation=assessment.recommendation,
     )
 
 
@@ -171,7 +109,7 @@ def save_report(
     novelty: NoveltyResult,
     fabrication: FabricationRiskResult,
     paper_id: str,
-    assessment: AssessmentSynthesisResult | None = None,
+    assessment: AssessmentSynthesisResult,
 ) -> Path:
     output_dir = Path("reports") / paper_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -184,7 +122,7 @@ def save_report(
         "## Key Findings\n"
         + _bullet_list(assessment.key_findings, "No additional synthesis findings were recorded.")
         + "\n\n"
-        if assessment and assessment.key_findings else ""
+        if assessment.key_findings else ""
     )
 
     content = f"""# Judgement Report: {report.title}
