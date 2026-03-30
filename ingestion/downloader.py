@@ -10,6 +10,16 @@ import requests
 ARXIV_ID_PATTERN = re.compile(r"(?P<paper_id>\d{4}\.\d{4,5})(v\d+)?$")
 
 
+def is_probable_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def is_local_pdf(value: str) -> bool:
+    path = Path(value).expanduser()
+    return path.exists() and path.is_file() and path.suffix.lower() == ".pdf"
+
+
 def extract_paper_id(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.netloc not in {"arxiv.org", "www.arxiv.org"}:
@@ -47,3 +57,12 @@ def download_pdf(url: str, output_dir: str | Path = "/tmp") -> Path:
     output_path.write_bytes(response.content)
     return output_path
 
+
+def resolve_pdf_input(source: str, output_dir: str | Path = "/tmp") -> tuple[Path, str]:
+    if is_local_pdf(source):
+        path = Path(source).expanduser().resolve()
+        return path, path.as_posix()
+    if is_probable_url(source):
+        path = download_pdf(source, output_dir=output_dir)
+        return path, source.strip()
+    raise ValueError("Input must be an arXiv URL or a local PDF path.")

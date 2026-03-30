@@ -15,6 +15,7 @@ class PaperSection(BaseModel):
 
 class PaperChunk(BaseModel):
     chunk_id: str
+    section_id: str
     section_name: str
     chunk_index: int
     content: str
@@ -38,18 +39,14 @@ class PaperDocument(BaseModel):
     chunks: list[PaperChunk] = Field(default_factory=list)
 
 
-ClaimType = Literal[
-    "benchmark_result",
-    "prior_work_comparison",
-    "factual_background",
-    "methodology_assertion",
-    "contribution_claim",
-    "unsupported_general_statement",
-    "contribution",
-    "result",
-    "novelty",
-    "factual",
-    "background",
+ClaimType = Literal["contribution", "result", "comparison", "factual", "method"]
+ClaimImportance = Literal["high", "medium", "low"]
+ClaimStatus = Literal[
+    "unverified",
+    "supported",
+    "contradicted",
+    "mixed",
+    "insufficient_evidence",
 ]
 
 
@@ -59,96 +56,71 @@ class Claim(BaseModel):
     claim_type: ClaimType
     source_section: str
     source_chunk_id: Optional[str] = None
-    importance: Literal["high", "medium", "low"] = "medium"
+    importance: ClaimImportance = "medium"
     nearby_citations: list[str] = Field(default_factory=list)
-    cited_refs: list[str] = Field(default_factory=list)
-    verification_status: Literal[
-        "unverified",
-        "supported",
-        "weak_support",
-        "citation_gap",
-        "contradicted",
-    ] = "unverified"
     confidence: float = 0.0
+    verification_status: ClaimStatus = "unverified"
 
 
 class EvidenceItem(BaseModel):
     evidence_id: str
+    query: str
     title: str
     url: str
+    domain: str
+    domain_tier: Literal["scholarly", "web"]
     snippet: str
-    source_type: Literal["web", "scholarly", "stub"]
     retrieval_score: float = 0.0
-    publication_year: Optional[int] = None
 
 
-class EvidenceFactCheckItem(BaseModel):
+class ClaimCheckResult(BaseModel):
     claim_id: str
-    verdict: Literal[
-        "supported",
-        "contradicted",
-        "mixed",
-        "insufficient_evidence",
-        "paper_supported_only",
-    ]
+    verdict: Literal["supported", "contradicted", "mixed", "insufficient_evidence"]
     confidence: float = 0.0
     reasoning: str
-    used_evidence_ids: list[str] = Field(default_factory=list)
+    matched_evidence_ids: list[str] = Field(default_factory=list)
     paper_context_excerpt: str = ""
     evidence_items: list[EvidenceItem] = Field(default_factory=list)
-
-
-class CredibilityBreakdown(BaseModel):
-    supported_claim_ratio: float = 0.0
-    contradicted_claim_ratio: float = 0.0
-    insufficient_evidence_ratio: float = 0.0
-    citation_coverage_ratio: float = 0.0
-    consistency_penalty: float = 0.0
-    parser_uncertainty: float = 0.0
-    high_impact_unverified_claim_count: int = 0
-    final_score: float = 0.0
-    risk_band: Literal["low", "medium", "high"] = "medium"
-    score_breakdown: dict[str, float] = Field(default_factory=dict)
-    explanation: str = ""
 
 
 class ConsistencyResult(BaseModel):
     score: int
     issues: list[str]
     reasoning: str
+    grounded_claim_count: int = 0
+    unresolved_claim_count: int = 0
 
 
 class GrammarResult(BaseModel):
     rating: Literal["High", "Medium", "Low"]
     reasoning: str
-
-
-class CitationResult(BaseModel):
-    score: int
-    citation_gaps: list[str]
-    reasoning: str
-
-
-class FactCheckItem(BaseModel):
-    claim_id: str
-    status: Literal["verified", "unverifiable", "suspicious"]
-    reasoning: str
-
-
-class FactCheckResult(BaseModel):
-    items: list[FactCheckItem]
+    issues: list[str] = Field(default_factory=list)
 
 
 class NoveltyResult(BaseModel):
     rating: Literal["High", "Moderate", "Low"]
     reasoning: str
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
 
 
-class CredibilityResult(BaseModel):
+class FabricationBreakdown(BaseModel):
+    contradicted_ratio: float = 0.0
+    mixed_ratio: float = 0.0
+    insufficient_evidence_ratio: float = 0.0
+    high_impact_insufficient_ratio: float = 0.0
+    evidence_coverage_ratio: float = 0.0
+    consistency_penalty_ratio: float = 0.0
+    final_score: float = 0.0
+    score_components: dict[str, float] = Field(default_factory=dict)
+    explanation: str = ""
+
+
+class FabricationRiskResult(BaseModel):
     score: float
+    risk_band: Literal["low", "medium", "high"]
     risk_factors: list[str]
     reasoning: str
-    breakdown: Optional[CredibilityBreakdown] = None
+    breakdown: FabricationBreakdown
 
 
 class FinalReport(BaseModel):
@@ -156,8 +128,6 @@ class FinalReport(BaseModel):
     summary: str
     consistency_score: int
     grammar_rating: str
-    citation_score: int
     novelty_rating: str
-    credibility_score: float
-    fabrication_probability: str
+    fabrication_risk: str
     recommendation: Literal["Pass", "Borderline", "Fail"]

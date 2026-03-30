@@ -1,140 +1,53 @@
 from __future__ import annotations
 
-import json
-
-from agents.llm_client import call_llm_json
-from models.schema import (
-    CitationResult,
-    Claim,
-    ConsistencyResult,
-    CredibilityBreakdown,
-    CredibilityResult,
-    EvidenceFactCheckItem,
-    FactCheckResult,
-    GrammarResult,
-    NoveltyResult,
-)
-from prompt_loader import load_prompt
-from scoring.credibility_model import compute_credibility_breakdown
+from models.schema import Claim, ClaimCheckResult, ConsistencyResult, FabricationRiskResult
+from scoring.credibility_model import compute_fabrication_breakdown
 
 
-def compute_credibility_score(
-    consistency: ConsistencyResult,
-    grammar: GrammarResult,
-    citation: CitationResult,
-    factcheck: FactCheckResult,
-    novelty: NoveltyResult,
-) -> tuple[float, str]:
-    novelty_risk = {"High": 5, "Moderate": 12, "Low": 28}[novelty.rating]
-    suspicious_count = sum(1 for item in factcheck.items if item.status == "suspicious")
-    suspicious_ratio = suspicious_count / max(len(factcheck.items), 1)
-    fact_risk = suspicious_ratio * 35
-    consistency_penalty = max(0, 85 - consistency.score) * 1.0
-    citation_penalty = max(0, 80 - citation.score) * 1.1
-    grammar_adjustment = {"High": -3, "Medium": 4, "Low": 12}[grammar.rating]
-    hard_penalty = 0.0
-    if citation.score < 55:
-        hard_penalty += 18
-    if consistency.score < 65:
-        hard_penalty += 14
-    if grammar.rating == "Low":
-        hard_penalty += 10
-    if not factcheck.items:
-        hard_penalty += 6
-    credibility_score = max(
-        0.0,
-        min(
-            100.0,
-            consistency_penalty + citation_penalty + novelty_risk
-            + fact_risk + grammar_adjustment + hard_penalty,
-        ),
-    )
-    return credibility_score, f"{round(credibility_score)}% risk"
-
-
-def _local_risk_factors(
-    consistency: ConsistencyResult,
-    grammar: GrammarResult,
-    citation: CitationResult,
-    factcheck: FactCheckResult,
-    novelty: NoveltyResult,
-) -> list[str]:
-    factors: list[str] = []
-    if consistency.score < 70:
-        factors.append("Internal consistency appears mixed rather than clearly strong.")
-    if citation.score < 65:
-        factors.append("Citation support is weak enough that important claims may not be adequately grounded.")
-    if any(item.status == "suspicious" for item in factcheck.items):
-        factors.append("At least one extracted claim was marked suspicious during fact checking.")
-    if not factcheck.items:
-        factors.append("No fact-check confirmations were produced, leaving core factual claims less supported.")
-    if novelty.rating == "Low":
-        factors.append("The novelty case appears weak relative to the parsed related-work context.")
-    if grammar.rating in {"Medium", "Low"}:
-        factors.append("Writing quality may make the technical claims harder to evaluate confidently.")
-    return factors or ["No major cross-signal risk factors were identified."]
+def _risk_band(score: float) -> str:
+    if score <= 30:
+        return "low"
+    if score <= 60:
+        return "medium"
+    return "high"
 
 
 def run_credibility_agent(
+    claims: list[Claim],
+    claim_checks: list[ClaimCheckResult],
     consistency: ConsistencyResult,
-    grammar: GrammarResult,
-    citation: CitationResult,
-    factcheck: FactCheckResult,
-    novelty: NoveltyResult,
-    critic_feedback: dict | None = None,
-    evidence_results: list[EvidenceFactCheckItem] | None = None,
-    claims: list[Claim] | None = None,
-) -> CredibilityResult:
-    critic_feedback = critic_feedback or {}
-
-    if evidence_results is not None and claims is not None:
-        breakdown: CredibilityBreakdown = compute_credibility_breakdown(
-            evidence_results=evidence_results,
-            claims=claims,
-            consistency=consistency,
-            citation=citation,
-            grammar=grammar,
-        )
-        score = breakdown.final_score
-        fallback_probability = f"{round(score)}% risk ({breakdown.risk_band} risk)"
-    else:
-        score, fallback_probability = compute_credibility_score(
-            consistency, grammar, citation, factcheck, novelty
-        )
-        breakdown = None
-
-    fallback_factors = _local_risk_factors(consistency, grammar, citation, factcheck, novelty)
-
-    prompt = load_prompt(
-        "credibility_review.txt",
-        schema_json='{"risk_factors": ["string"], "reasoning": "string"}',
-        signals_json=json.dumps(
-            {
-                "consistency": consistency.model_dump(),
-                "grammar": grammar.model_dump(),
-                "citation": citation.model_dump(),
-                "factcheck": factcheck.model_dump(),
-                "novelty": novelty.model_dump(),
-                "critic": critic_feedback,
-                **({"credibility_breakdown": breakdown.model_dump()} if breakdown else {}),
-            },
-            indent=2,
-        ),
+) -> FabricationRiskResult:
+    breakdown = compute_fabrication_breakdown(
+        claims=claims,
+        claim_checks=claim_checks,
+        consistency=consistency,
     )
-    payload = call_llm_json(
-        prompt,
-        fallback={
-            "risk_factors": fallback_factors,
-            "reasoning": (
-                "Evidence-backed credibility analysis. "
-                + (breakdown.explanation if breakdown else fallback_probability)
-            ),
-        },
+    score = breakdown.final_score
+    band = _risk_band(score)
+
+    risk_factors: list[str] = []
+    if breakdown.contradicted_ratio > 0:
+        risk_factors.append("At least one evidence-checked claim is contradicted by external evidence.")
+    if breakdown.insufficient_evidence_ratio >= 0.5:
+        risk_factors.append("A large share of checked claims could not be verified with strong external evidence.")
+    if breakdown.high_impact_insufficient_ratio > 0:
+        risk_factors.append("Some high-importance claims could not be supported with strong external evidence.")
+    if breakdown.evidence_coverage_ratio < 0.5:
+        risk_factors.append("Less than half of externally checkable claims received usable evidence coverage.")
+    if consistency.score < 70:
+        risk_factors.append("Consistency is weakened by unresolved or contradictory claim support.")
+    if not risk_factors:
+        risk_factors.append("No major grounded fabrication signals were detected in the checked claim set.")
+
+    reasoning = (
+        f"Fabrication risk is {score:.1f}/100 ({band} risk). "
+        + breakdown.explanation
     )
 
-    return CredibilityResult(
-        score=round(score, 2),
-        risk_factors=[str(f) for f in payload.get("risk_factors", [])],
-        reasoning=str(payload.get("reasoning", fallback_probability)),
+    return FabricationRiskResult(
+        score=score,
+        risk_band=band,
+        risk_factors=risk_factors,
+        reasoning=reasoning,
         breakdown=breakdown,
     )

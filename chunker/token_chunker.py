@@ -7,11 +7,12 @@ import tiktoken
 from models.schema import PaperChunk, PaperDocument, PaperSection
 
 
-MAX_TOKENS = 14_000
-
-CLAIM_CHUNK_TOKENS = 6_000
-
-CHUNK_OVERLAP_TOKENS = 200
+MAX_LLM_TOKENS = 16_000
+DEFAULT_SAFETY_MARGIN = 1_000
+DEFAULT_WINDOW_TOKENS = 5_000
+DEFAULT_OVERLAP_TOKENS = 500
+GRAMMAR_SAMPLE_TOKENS = 3_500
+VERIFIER_MAX_INPUT_TOKENS = 8_500
 
 _ENCODING = None
 
@@ -34,11 +35,34 @@ def count_tokens(text: str) -> int:
     return max(1, len((text or "").split()))
 
 
-def _split_large_block(block: str, max_tokens: int) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", block.strip())
+def truncate_to_token_limit(text: str, max_tokens: int) -> str:
+    if count_tokens(text) <= max_tokens:
+        return text
+
+    paragraphs = [part.strip() for part in text.split("\n") if part.strip()]
+    selected: list[str] = []
+    for paragraph in paragraphs:
+        candidate = "\n\n".join(selected + [paragraph]).strip()
+        if selected and count_tokens(candidate) > max_tokens:
+            break
+        selected.append(paragraph)
+    if selected:
+        return "\n\n".join(selected).strip()
+
+    words = text.split()
+    current: list[str] = []
+    for word in words:
+        candidate = " ".join(current + [word]).strip()
+        if current and count_tokens(candidate) > max_tokens:
+            break
+        current.append(word)
+    return " ".join(current).strip()
+
+
+def _split_large_paragraph(paragraph: str, max_tokens: int) -> list[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
     chunks: list[str] = []
     current = ""
-
     for sentence in sentences:
         candidate = f"{current} {sentence}".strip()
         if current and count_tokens(candidate) > max_tokens:
@@ -46,50 +70,20 @@ def _split_large_block(block: str, max_tokens: int) -> list[str]:
             current = sentence
         else:
             current = candidate
-
     if current:
         chunks.append(current)
-    return chunks or [block]
+    return chunks or [paragraph]
 
 
-def chunk_text(text: str, max_tokens: int = MAX_TOKENS) -> list[str]:
-    if count_tokens(text) <= max_tokens:
-        return [text]
-
-    paragraphs = [paragraph.strip() for paragraph in text.split("\n") if paragraph.strip()]
-    chunks: list[str] = []
-    current = ""
-
+def _split_text_to_units(text: str, max_tokens: int) -> list[str]:
+    paragraphs = [part.strip() for part in text.split("\n") if part.strip()]
+    units: list[str] = []
     for paragraph in paragraphs:
         if count_tokens(paragraph) > max_tokens:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(_split_large_block(paragraph, max_tokens))
-            continue
-
-        candidate = f"{current}\n\n{paragraph}".strip()
-        if current and count_tokens(candidate) > max_tokens:
-            chunks.append(current)
-            current = paragraph
+            units.extend(_split_large_paragraph(paragraph, max_tokens))
         else:
-            current = candidate
-
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def chunk_section(section: PaperSection, max_tokens: int = MAX_TOKENS) -> list[str]:
-    return chunk_text(section.content, max_tokens=max_tokens)
-
-
-def chunk_all_sections(document: PaperDocument, max_tokens: int = MAX_TOKENS) -> PaperDocument:
-    updated_sections = [
-        section.model_copy(update={"token_count": count_tokens(section.content)})
-        for section in document.sections
-    ]
-    return document.model_copy(update={"sections": updated_sections})
+            units.append(paragraph)
+    return units or ([text.strip()] if text.strip() else [])
 
 
 def _extract_overlap_tail(text: str, overlap_tokens: int) -> str:
@@ -99,82 +93,93 @@ def _extract_overlap_tail(text: str, overlap_tokens: int) -> str:
     tail = ""
     for sentence in reversed(sentences):
         candidate = f"{sentence} {tail}".strip()
-        if count_tokens(candidate) > overlap_tokens:
+        if tail and count_tokens(candidate) > overlap_tokens:
             break
         tail = candidate
-    return tail
+        if count_tokens(tail) >= overlap_tokens:
+            break
+    return tail.strip()
 
 
-def recursive_chunk_section(
-    section: PaperSection,
-    max_tokens: int = CLAIM_CHUNK_TOKENS,
-    overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
-) -> list[PaperChunk]:
-    text = section.content
-    section_name = section.heading
-
+def rolling_window_text(
+    text: str,
+    max_tokens: int = DEFAULT_WINDOW_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> list[str]:
+    if not text.strip():
+        return []
     if count_tokens(text) <= max_tokens:
-        return [
-            PaperChunk(
-                chunk_id=f"{section.section_id}_c0",
-                section_name=section_name,
-                chunk_index=0,
-                content=text,
-                token_count=count_tokens(text),
-            )
-        ]
+        return [text.strip()]
 
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    raw_chunks: list[str] = []
+    units = _split_text_to_units(text, max_tokens=max_tokens)
+    chunks: list[str] = []
     current = ""
     overlap_prefix = ""
 
-    for paragraph in paragraphs:
-        if count_tokens(paragraph) > max_tokens:
-            if current:
-                raw_chunks.append(current)
-                overlap_prefix = _extract_overlap_tail(current, overlap_tokens)
-                current = ""
-            sub_chunks = _split_large_block(paragraph, max_tokens)
-            for sub in sub_chunks:
-                candidate = f"{overlap_prefix}\n\n{sub}".strip() if overlap_prefix else sub
-                if count_tokens(candidate) <= max_tokens:
-                    raw_chunks.append(candidate)
-                    overlap_prefix = _extract_overlap_tail(candidate, overlap_tokens)
-                else:
-                    raw_chunks.append(sub)
-                    overlap_prefix = _extract_overlap_tail(sub, overlap_tokens)
-            continue
-
-        candidate = f"{current}\n\n{paragraph}".strip()
+    for unit in units:
+        candidate = f"{current}\n\n{unit}".strip() if current else unit
         if current and count_tokens(candidate) > max_tokens:
-            raw_chunks.append(current)
+            chunks.append(current.strip())
             overlap_prefix = _extract_overlap_tail(current, overlap_tokens)
-            current = f"{overlap_prefix}\n\n{paragraph}".strip() if overlap_prefix else paragraph
+            current = f"{overlap_prefix}\n\n{unit}".strip() if overlap_prefix else unit
         else:
             current = candidate
 
-    if current:
-        raw_chunks.append(current)
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
 
-    return [
-        PaperChunk(
-            chunk_id=f"{section.section_id}_c{i}",
-            section_name=section_name,
-            chunk_index=i,
-            content=chunk,
-            token_count=count_tokens(chunk),
-        )
-        for i, chunk in enumerate(raw_chunks)
-        if chunk.strip()
+
+def chunk_all_sections(document: PaperDocument) -> PaperDocument:
+    updated_sections = [
+        section.model_copy(update={"token_count": count_tokens(section.content)})
+        for section in document.sections
     ]
+    return document.model_copy(update={"sections": updated_sections})
 
 
 def build_all_chunks(
     document: PaperDocument,
-    max_tokens: int = CLAIM_CHUNK_TOKENS,
+    max_tokens: int = DEFAULT_WINDOW_TOKENS,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
 ) -> list[PaperChunk]:
-    all_chunks: list[PaperChunk] = []
+    chunks: list[PaperChunk] = []
     for section in document.sections:
-        all_chunks.extend(recursive_chunk_section(section, max_tokens=max_tokens))
-    return all_chunks
+        section_windows = rolling_window_text(
+            section.content,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        for index, window in enumerate(section_windows):
+            chunks.append(
+                PaperChunk(
+                    chunk_id=f"{section.section_id}_c{index}",
+                    section_id=section.section_id,
+                    section_name=section.heading,
+                    chunk_index=index,
+                    content=window,
+                    token_count=count_tokens(window),
+                )
+            )
+    return chunks
+
+
+def build_context_bundle(
+    chunks: list[PaperChunk],
+    max_tokens: int,
+    heading_filter: set[str] | None = None,
+) -> str:
+    selected: list[str] = []
+    for chunk in chunks:
+        if heading_filter and chunk.section_name.lower() not in heading_filter:
+            continue
+        entry = f"[{chunk.section_name} | {chunk.chunk_id}]\n{chunk.content}".strip()
+        candidate = "\n\n".join(selected + [entry]).strip()
+        if selected and count_tokens(candidate) > max_tokens:
+            break
+        selected.append(entry)
+    return "\n\n".join(selected).strip()
+
+
+def safe_prompt_room(max_prompt_tokens: int = MAX_LLM_TOKENS) -> int:
+    return max(1_000, max_prompt_tokens - DEFAULT_SAFETY_MARGIN)
