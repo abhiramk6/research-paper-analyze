@@ -44,13 +44,13 @@ High-level flow in [pipeline.py](/Users/abhiramkamini/Downloads/hivel assignment
 
 Key components:
 
-- [claims/claim_extractor.py](/Users/abhiramkamini/Downloads/hivel assignment /claims/claim_extractor.py): extracts typed claims with confidence, importance, and chunk provenance
-- [retrieval/retriever.py](/Users/abhiramkamini/Downloads/hivel assignment /retrieval/retriever.py): retrieves external web evidence
-- [retrieval/query_builder.py](/Users/abhiramkamini/Downloads/hivel assignment /retrieval/query_builder.py): builds claim-focused search queries
-- [retrieval/evidence_ranker.py](/Users/abhiramkamini/Downloads/hivel assignment /retrieval/evidence_ranker.py): ranks evidence for verifier use
-- [verification/verifier_agent.py](/Users/abhiramkamini/Downloads/hivel assignment /verification/verifier_agent.py): assigns claim verdicts from paper context plus external evidence
-- [scoring/credibility_model.py](/Users/abhiramkamini/Downloads/hivel assignment /scoring/credibility_model.py): computes an interpretable credibility risk breakdown
-- [reporter/report_writer.py](/Users/abhiramkamini/Downloads/hivel assignment /reporter/report_writer.py): writes the final Markdown report
+- [claims/claim_extractor.py](claims/claim_extractor.py): extracts typed claims with confidence, importance, and chunk provenance
+- [retrieval/retriever.py](retrieval/retriever.py): retrieves external web evidence
+- [retrieval/query_builder.py](retrieval/query_builder.py): builds claim-focused search queries
+- [retrieval/evidence_ranker.py](retrieval/evidence_ranker.py): ranks evidence for verifier use
+- [verification/verifier_agent.py](verification/verifier_agent.py): assigns claim verdicts from paper context plus external evidence
+- [scoring/credibility_model.py](scoring/credibility_model.py): computes an interpretable credibility risk breakdown
+- [reporter/report_writer.py](reporter/report_writer.py): writes the final Markdown report
 
 ## Output
 
