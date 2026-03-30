@@ -7,3 +7,5 @@ pydantic==2.11.3
 requests==2.32.3
 python-dotenv==1.1.0
 pandas==2.2.3
+duckduckgo-search>=6.0
+pyyaml>=6.0

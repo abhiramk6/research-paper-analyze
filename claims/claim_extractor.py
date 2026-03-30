@@ -4,12 +4,39 @@ import json
 import re
 
 from agents.llm_client import call_llm_json
-from chunker.token_chunker import chunk_text
-from models.schema import Claim, PaperDocument, PaperSection
-from prompt_loader import load_prompt
+from chunker.token_chunker import CLAIM_CHUNK_TOKENS, build_all_chunks, count_tokens
+from models.schema import Claim, PaperChunk, PaperDocument, PaperSection
 
 
-CLAIM_SECTIONS = ("abstract", "introduction", "method", "methodology", "results", "conclusion")
+# Sections whose content is worth extracting claims from.
+CLAIM_SECTIONS = (
+    "abstract", "introduction", "method", "methodology",
+    "results", "conclusion", "related work", "background",
+    "experiments", "evaluation", "analysis",
+)
+
+# New typed claim taxonomy (v2) + legacy types (v1) for backward compatibility.
+_VALID_CLAIM_TYPES = frozenset(
+    [
+        "benchmark_result",
+        "prior_work_comparison",
+        "factual_background",
+        "methodology_assertion",
+        "contribution_claim",
+        "unsupported_general_statement",
+        # Legacy
+        "contribution",
+        "result",
+        "novelty",
+        "factual",
+        "background",
+    ]
+)
+
+_IMPORTANCE_TYPES = frozenset(["benchmark_result", "result", "prior_work_comparison", "novelty"])
+_MEDIUM_IMPORTANCE_TYPES = frozenset(
+    ["factual_background", "factual", "contribution_claim", "contribution", "methodology_assertion"]
+)
 
 
 def _section_is_claim_relevant(section: PaperSection) -> bool:
@@ -26,110 +53,115 @@ def _extract_citations(text: str) -> list[str]:
 
 
 def _normalize_claim_type(value: str) -> str:
-    if value in {"contribution", "result", "novelty", "factual", "background"}:
-        return value
-    return "background"
+    v = value.strip().lower().replace(" ", "_")
+    if v in _VALID_CLAIM_TYPES:
+        return v
+    # Loose mapping for LLM variations.
+    if "benchmark" in v or "metric" in v:
+        return "benchmark_result"
+    if "prior" in v or "comparison" in v or "baseline" in v:
+        return "prior_work_comparison"
+    if "method" in v or "approach" in v or "architecture" in v:
+        return "methodology_assertion"
+    if "contribution" in v or "propose" in v:
+        return "contribution_claim"
+    if "factual" in v or "background" in v:
+        return "factual_background"
+    return "unsupported_general_statement"
 
 
-def _build_prompt(section_heading: str, chunk: str) -> str:
+def _infer_importance(claim_type: str, confidence: float) -> str:
+    if claim_type in _IMPORTANCE_TYPES or confidence >= 0.8:
+        return "high"
+    if claim_type in _MEDIUM_IMPORTANCE_TYPES or confidence >= 0.6:
+        return "medium"
+    return "low"
+
+
+def _build_chunk_prompt(chunk: PaperChunk) -> str:
     schema = {
         "claims": [
             {
                 "claim_id": "string",
                 "text": "string",
-                "claim_type": "contribution|result|novelty|factual|background",
-                "source_section": section_heading,
-                "cited_refs": ["string"],
+                "claim_type": (
+                    "benchmark_result|prior_work_comparison|factual_background|"
+                    "methodology_assertion|contribution_claim|unsupported_general_statement"
+                ),
+                "source_section": chunk.section_name,
+                "source_chunk_id": chunk.chunk_id,
+                "nearby_citations": ["string"],
+                "importance": "high|medium|low",
                 "confidence": 0.0,
             }
         ]
     }
-    return load_prompt(
-        "claim_extraction.txt",
-        schema_json=json.dumps(schema),
-        section_heading=section_heading,
-        chunk=chunk,
+    instructions = (
+        "You are a precise scientific claim extractor.\n\n"
+        "Extract the most important, verifiable claims from the section below. "
+        "Assign each claim the correct type:\n"
+        "  benchmark_result     — numerical results, metric scores, performance comparisons\n"
+        "  prior_work_comparison — comparisons to other methods, baselines, prior papers\n"
+        "  factual_background   — external facts, dataset descriptions, field-wide stats\n"
+        "  methodology_assertion — claims about how the proposed method works\n"
+        "  contribution_claim   — top-level contribution assertions ('we propose', 'we introduce')\n"
+        "  unsupported_general_statement — vague or unverifiable assertions\n\n"
+        "Rules:\n"
+        "- Do NOT paraphrase — use close to the original text.\n"
+        "- Capture nearby citations as nearby_citations (e.g. ['12', '15']).\n"
+        "- Set importance='high' for numerical results and external comparisons.\n"
+        "- Set confidence in [0, 1] for how confidently this is a real extractable claim.\n"
+        "- Skip sub-8-word fragments, headers, and figure captions.\n"
+        f"- Respond only with valid JSON matching:\n{json.dumps(schema, indent=2)}\n\n"
+        f"Section: [{chunk.section_name}]  Chunk: {chunk.chunk_id}\n\n"
+        f"{chunk.content}"
     )
+    return instructions
 
 
-def _group_sections(document: PaperDocument) -> list[tuple[str, str]]:
-    grouped_sections: list[tuple[str, str]] = []
-    current_heading = "paper_overview"
-    current_parts: list[str] = []
-
-    for section in document.sections:
-        if not _section_is_claim_relevant(section):
-            continue
-        section_heading = section.heading.lower()
-        if any(name in section_heading for name in ("method", "methodology", "results")):
-            group_name = "technical_findings"
-        elif any(name in section_heading for name in ("abstract", "introduction", "conclusion")):
-            group_name = "paper_overview"
-        else:
-            group_name = "supporting_context"
-
-        formatted_section = f"[{section.heading}]\n{section.content.strip()}"
-        if current_parts and group_name != current_heading:
-            grouped_sections.append((current_heading, "\n\n".join(current_parts)))
-            current_parts = []
-        current_heading = group_name
-        current_parts.append(formatted_section)
-
-    if current_parts:
-        grouped_sections.append((current_heading, "\n\n".join(current_parts)))
-    return grouped_sections
-
-
-def _infer_claim_type(sentence: str, source_section: str) -> str:
-    sentence_lower = sentence.lower()
-    section_lower = source_section.lower()
-    if any(keyword in sentence_lower for keyword in ("we propose", "our approach", "introduce", "present")):
-        return "contribution"
-    if any(keyword in sentence_lower for keyword in ("outperform", "achieve", "improve", "results", "accuracy", "score")):
-        return "result"
-    if any(keyword in sentence_lower for keyword in ("novel", "first", "new", "unlike prior")):
-        return "novelty"
-    if "result" in section_lower or "conclusion" in section_lower:
-        return "result"
-    return "factual"
+def _infer_claim_type_fallback(sentence: str, source_section: str) -> str:
+    s = sentence.lower()
+    sec = source_section.lower()
+    if any(k in s for k in ("we propose", "our approach", "introduce", "present")):
+        return "contribution_claim"
+    if any(k in s for k in ("outperform", "achieve", "improve", "accuracy", "score", "%", "bleu", "rouge")):
+        return "benchmark_result"
+    if any(k in s for k in ("novel", "first", "unlike prior", "compared to")):
+        return "prior_work_comparison"
+    if any(k in s for k in ("method", "architecture", "layer", "trained")):
+        return "methodology_assertion"
+    if "result" in sec or "conclusion" in sec:
+        return "benchmark_result"
+    return "factual_background"
 
 
 def _local_claim_fallback(document: PaperDocument, starting_counter: int = 1) -> list[Claim]:
-    candidate_sections = [
-        section
-        for section in document.sections
-        if _section_is_claim_relevant(section)
-    ]
+    candidate_sections = [s for s in document.sections if _section_is_claim_relevant(s)]
     fallback_claims: list[Claim] = []
 
     for section in candidate_sections:
         sentences = re.split(r"(?<=[.!?])\s+", section.content)
         for sentence in sentences:
-            clean_sentence = re.sub(r"\s+", " ", sentence).strip()
-            if len(clean_sentence.split()) < 8:
+            clean = re.sub(r"\s+", " ", sentence).strip()
+            if len(clean.split()) < 8:
                 continue
             if not any(
-                keyword in clean_sentence.lower()
-                for keyword in (
-                    "we ",
-                    "our ",
-                    "show",
-                    "demonstrate",
-                    "achieve",
-                    "improve",
-                    "propose",
-                    "introduce",
-                    "outperform",
-                )
+                keyword in clean.lower()
+                for keyword in ("we ", "our ", "show", "demonstrate", "achieve", "improve",
+                                "propose", "introduce", "outperform", "%", "bleu", "rouge")
             ):
                 continue
+            ctype = _infer_claim_type_fallback(clean, section.heading)
             fallback_claims.append(
                 Claim(
                     claim_id=f"claim_{starting_counter}",
-                    text=clean_sentence[:400],
-                    claim_type=_infer_claim_type(clean_sentence, section.heading),
+                    text=clean[:400],
+                    claim_type=ctype,
                     source_section=section.heading,
-                    cited_refs=_extract_citations(clean_sentence),
+                    source_chunk_id=None,
+                    importance=_infer_importance(ctype, 0.45),
+                    nearby_citations=_extract_citations(clean),
+                    cited_refs=_extract_citations(clean),
                     confidence=0.45,
                 )
             )
@@ -139,44 +171,88 @@ def _local_claim_fallback(document: PaperDocument, starting_counter: int = 1) ->
     return fallback_claims
 
 
+def _relevant_chunks(document: PaperDocument) -> list[PaperChunk]:
+    """Return pre-built chunks; fall back to building them if missing."""
+    if document.chunks:
+        return [
+            chunk for chunk in document.chunks
+            if any(name in chunk.section_name.lower() for name in CLAIM_SECTIONS)
+        ]
+    # Build on demand if pipeline skipped chunk pre-build.
+    all_chunks = build_all_chunks(document, max_tokens=CLAIM_CHUNK_TOKENS)
+    return [
+        chunk for chunk in all_chunks
+        if any(name in chunk.section_name.lower() for name in CLAIM_SECTIONS)
+    ]
+
+
 def extract_claims(document: PaperDocument) -> list[Claim]:
+    """
+    Extract claims chunk-by-chunk from the document.
+
+    Each claim gets:
+      - claim_id, text, claim_type (new taxonomy)
+      - source_section, source_chunk_id
+      - importance (high/medium/low)
+      - nearby_citations, cited_refs
+      - confidence
+
+    Falls back to heuristic extraction if LLM returns nothing.
+    """
     claims: list[Claim] = []
     counter = 1
     seen_texts: set[str] = set()
 
-    for group_heading, group_text in _group_sections(document):
-        for chunk in chunk_text(group_text, max_tokens=9_000):
-            payload = call_llm_json(_build_prompt(group_heading, chunk), fallback={"claims": []})
-            raw_claims = payload.get("claims", [])
+    for chunk in _relevant_chunks(document):
+        # Token-safe: each chunk is already bounded by CLAIM_CHUNK_TOKENS.
+        prompt = _build_chunk_prompt(chunk)
+        payload = call_llm_json(prompt, fallback={"claims": []})
+        raw_claims = payload.get("claims", [])
 
-            for item in raw_claims:
-                claim_text = str(item.get("text", "")).strip()
-                if not claim_text:
-                    continue
-                normalized_text = re.sub(r"\s+", " ", claim_text).strip().lower()
-                if normalized_text in seen_texts:
-                    continue
-                claim_type = _normalize_claim_type(str(item.get("claim_type", "background")))
-                confidence = float(item.get("confidence", 0.0) or 0.0)
-                if claim_type == "background" or confidence < 0.35:
-                    continue
-                cited_refs = [str(ref).strip() for ref in item.get("cited_refs", []) if str(ref).strip()]
-                if not cited_refs:
-                    cited_refs = _extract_citations(claim_text)
-                seen_texts.add(normalized_text)
-                claims.append(
-                    Claim(
-                        claim_id=f"claim_{counter}",
-                        text=claim_text,
-                        claim_type=claim_type,
-                        source_section=group_heading,
-                        cited_refs=cited_refs,
-                        confidence=confidence,
-                    )
+        for item in raw_claims:
+            claim_text = str(item.get("text", "")).strip()
+            if not claim_text:
+                continue
+            normalized_text = re.sub(r"\s+", " ", claim_text).strip().lower()
+            if normalized_text in seen_texts:
+                continue
+
+            claim_type = _normalize_claim_type(str(item.get("claim_type", "unsupported_general_statement")))
+            confidence = float(item.get("confidence") or 0.0)
+
+            # Filter noise: very low confidence and vague statement types.
+            if claim_type == "unsupported_general_statement" and confidence < 0.5:
+                continue
+            if confidence < 0.30:
+                continue
+
+            importance_raw = str(item.get("importance", "")).lower()
+            if importance_raw in ("high", "medium", "low"):
+                importance = importance_raw
+            else:
+                importance = _infer_importance(claim_type, confidence)
+
+            nearby = [str(r).strip() for r in item.get("nearby_citations", []) if str(r).strip()]
+            if not nearby:
+                nearby = _extract_citations(claim_text)
+
+            seen_texts.add(normalized_text)
+            claims.append(
+                Claim(
+                    claim_id=f"claim_{counter}",
+                    text=claim_text[:500],
+                    claim_type=claim_type,
+                    source_section=str(item.get("source_section", chunk.section_name)),
+                    source_chunk_id=str(item.get("source_chunk_id", chunk.chunk_id)),
+                    importance=importance,
+                    nearby_citations=nearby,
+                    cited_refs=nearby,
+                    confidence=round(confidence, 3),
                 )
-                counter += 1
-                if counter > 12:
-                    return claims
+            )
+            counter += 1
+            if counter > 14:
+                return claims
 
     if not claims:
         return _local_claim_fallback(document, starting_counter=counter)

@@ -10,6 +10,18 @@ class PaperSection(BaseModel):
     heading: str
     content: str
     token_count: int = 0
+    # LLM-assigned canonical category (e.g. "methodology", "results", "introduction").
+    # Populated by the section normalizer after parsing; None until then.
+    canonical_category: Optional[str] = None
+
+
+class PaperChunk(BaseModel):
+    """A bounded text chunk derived from a section, used as the primary unit for claim extraction."""
+    chunk_id: str
+    section_name: str
+    chunk_index: int
+    content: str
+    token_count: int = 0
 
 
 class ReferenceItem(BaseModel):
@@ -26,13 +38,35 @@ class PaperDocument(BaseModel):
     abstract: str
     sections: list[PaperSection]
     references: list[ReferenceItem]
+    chunks: list[PaperChunk] = Field(default_factory=list)
+
+
+# Extended claim type set — includes both legacy types and new typed categories.
+ClaimType = Literal[
+    # New typed categories (v2)
+    "benchmark_result",
+    "prior_work_comparison",
+    "factual_background",
+    "methodology_assertion",
+    "contribution_claim",
+    "unsupported_general_statement",
+    # Legacy types (v1) — kept for backward compatibility
+    "contribution",
+    "result",
+    "novelty",
+    "factual",
+    "background",
+]
 
 
 class Claim(BaseModel):
     claim_id: str
     text: str
-    claim_type: Literal["contribution", "result", "novelty", "factual", "background"]
+    claim_type: ClaimType
     source_section: str
+    source_chunk_id: Optional[str] = None
+    importance: Literal["high", "medium", "low"] = "medium"
+    nearby_citations: list[str] = Field(default_factory=list)
     cited_refs: list[str] = Field(default_factory=list)
     verification_status: Literal[
         "unverified",
@@ -42,6 +76,49 @@ class Claim(BaseModel):
         "contradicted",
     ] = "unverified"
     confidence: float = 0.0
+
+
+class EvidenceItem(BaseModel):
+    """A single piece of external evidence retrieved for a claim."""
+    evidence_id: str
+    title: str
+    url: str
+    snippet: str
+    source_type: Literal["web", "scholarly", "stub"]
+    retrieval_score: float = 0.0
+    publication_year: Optional[int] = None
+
+
+class EvidenceFactCheckItem(BaseModel):
+    """Evidence-backed fact-check result for a single claim."""
+    claim_id: str
+    verdict: Literal[
+        "supported",
+        "contradicted",
+        "mixed",
+        "insufficient_evidence",
+        "paper_supported_only",
+    ]
+    confidence: float = 0.0
+    reasoning: str
+    used_evidence_ids: list[str] = Field(default_factory=list)
+    paper_context_excerpt: str = ""
+    evidence_items: list[EvidenceItem] = Field(default_factory=list)
+
+
+class CredibilityBreakdown(BaseModel):
+    """Interpretable, feature-level credibility breakdown replacing the opaque fabrication score."""
+    supported_claim_ratio: float = 0.0
+    contradicted_claim_ratio: float = 0.0
+    insufficient_evidence_ratio: float = 0.0
+    citation_coverage_ratio: float = 0.0
+    consistency_penalty: float = 0.0
+    parser_uncertainty: float = 0.0
+    high_impact_unverified_claim_count: int = 0
+    final_score: float = 0.0
+    risk_band: Literal["low", "medium", "high"] = "medium"
+    score_breakdown: dict[str, float] = Field(default_factory=dict)
+    explanation: str = ""
 
 
 class ConsistencyResult(BaseModel):
@@ -80,6 +157,7 @@ class CredibilityResult(BaseModel):
     score: float
     risk_factors: list[str]
     reasoning: str
+    breakdown: Optional[CredibilityBreakdown] = None
 
 
 class FinalReport(BaseModel):
@@ -92,4 +170,3 @@ class FinalReport(BaseModel):
     credibility_score: float
     fabrication_probability: str
     recommendation: Literal["Pass", "Borderline", "Fail"]
-

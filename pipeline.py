@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from dotenv import load_dotenv
@@ -10,20 +11,37 @@ from typing_extensions import TypedDict
 from agents.citation_agent import run_citation_agent
 from agents.consistency_agent import run_consistency_agent
 from agents.credibility_agent import run_credibility_agent
-from agents.factcheck_agent import run_factcheck_agent
-from agents.llm_client import call_llm_json
+from agents.factcheck_agent import evidence_factcheck_to_legacy, run_factcheck_agent
 from agents.grammar_agent import run_grammar_agent
+from agents.llm_client import call_llm_json
 from agents.novelty_agent import run_novelty_agent
 from aggregator.report_builder import build_report
-from chunker.token_chunker import chunk_all_sections, chunk_text, count_tokens
+from chunker.token_chunker import build_all_chunks, chunk_all_sections, chunk_text, count_tokens
 from claims.claim_extractor import extract_claims
 from ingestion.downloader import download_pdf
 from parser.pdf_parser import parse_paper
+from parser.section_normalizer import normalize_section_headings
 from prompt_loader import load_prompt
 from reporter.report_writer import save_report
+from retrieval.evidence_ranker import rank_evidence
+from retrieval.query_builder import build_queries
+from retrieval.retriever import EvidenceRetriever
+from verification.claim_router import routing_decision
+from verification.critic_agent import build_retry_query, should_retry
+from verification.verifier_agent import verify_claim
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+# Shared retriever — constructed once per pipeline run.
+_RETRIEVER = EvidenceRetriever()
+
+# Top-K evidence items forwarded to each verifier call.
+_VERIFIER_TOP_K = 5
+
+# Maximum retries for weak-evidence high-importance claims.
+_MAX_RETRIES = 1
 
 
 class EvaluatorState(TypedDict, total=False):
@@ -44,12 +62,17 @@ class EvaluatorState(TypedDict, total=False):
     report: Any
     report_path: str
     paper_id: str
+    # v2 — evidence-backed verification results
+    evidence_results: list[Any]
+    # routing metadata for debugging / agentic transparency
+    routing_log: list[dict[str, Any]]
 
 
 def _section_snapshot(document) -> list[dict[str, Any]]:
     return [
         {
             "heading": section.heading,
+            "canonical_category": section.canonical_category or "unknown",
             "token_count": section.token_count,
             "preview": section.content[:500],
         }
@@ -57,9 +80,21 @@ def _section_snapshot(document) -> list[dict[str, Any]]:
     ]
 
 
-def _section_matches(section_heading: str, keywords: list[str]) -> bool:
-    normalized_heading = section_heading.lower()
-    return any(keyword.lower() in normalized_heading for keyword in keywords)
+def _section_matches(section_heading: str, keywords: list[str], canonical: str | None = None) -> bool:
+    """
+    Match a section against a list of keywords.
+
+    Checks canonical category first (exact or substring), then falls back to
+    raw heading keyword matching.  The canonical category comes from the LLM
+    normalizer, so "3. Our Proposed Architecture" → canonical="methodology"
+    will correctly match keyword "method".
+    """
+    kw_lower = [k.lower() for k in keywords]
+    if canonical:
+        cat = canonical.lower()
+        if any(k in cat or cat in k for k in kw_lower):
+            return True
+    return any(k in section_heading.lower() for k in kw_lower)
 
 
 def _bounded_join(parts: list[str], max_tokens: int = 12_000) -> str:
@@ -76,25 +111,50 @@ def _packet_from_keywords(document, keywords: list[str], fallback_headings: list
     selected = [
         f"[{section.heading}]\n{section.content.strip()}"
         for section in document.sections
-        if _section_matches(section.heading, keywords)
+        if _section_matches(section.heading, keywords, canonical=section.canonical_category)
     ]
     if not selected:
+        # Canonical fallback: match against canonical categories directly.
         selected = [
             f"[{section.heading}]\n{section.content.strip()}"
             for section in document.sections
-            if section.heading in fallback_headings
+            if (
+                section.heading in fallback_headings
+                or (section.canonical_category and section.canonical_category in
+                    [h.lower() for h in fallback_headings])
+            )
         ]
-
     bounded_parts: list[str] = []
     for section_text in selected:
         bounded_parts.extend(chunk_text(section_text, max_tokens=min(max_tokens, 4_000)))
     return _bounded_join(bounded_parts, max_tokens=max_tokens)
 
 
+def _paper_context_for_claim(document, claim) -> str:
+    """Return a short paper-local context snippet for a claim, capped for verifier budget."""
+    target_heading = claim.source_section or ""
+    for section in document.sections:
+        if target_heading.lower() in section.heading.lower() or section.heading.lower() in target_heading.lower():
+            return section.content[:1_200]
+    return document.abstract[:800]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline nodes
+# ---------------------------------------------------------------------------
+
 def ingest_paper_node(state: EvaluatorState) -> EvaluatorState:
     pdf_path = download_pdf(state["url"])
     document = parse_paper(pdf_path, source_url=state["url"])
+    # Update token counts on sections.
     document = chunk_all_sections(document)
+    # LLM-normalize raw PDF headings → canonical categories (methodology, results, etc.)
+    # This runs ONE LLM call so arbitrary paper titles like "3. Our Proposed Architecture"
+    # get mapped correctly instead of falling through keyword matching.
+    document = normalize_section_headings(document)
+    # Pre-build all PaperChunks and store them on the document for downstream use.
+    chunks = build_all_chunks(document)
+    document = document.model_copy(update={"chunks": chunks})
     return {
         "pdf_path": str(pdf_path),
         "document": document,
@@ -120,7 +180,12 @@ def planner_agent_node(state: EvaluatorState) -> EvaluatorState:
         "citation_mode": "claims_and_references",
         "factcheck_sections": ["results", "evaluation", "analysis"],
         "novelty_sections": ["abstract", "background", "related work", "introduction"],
-        "planner_notes": "Sequential LangGraph execution with bounded evidence packets to keep each downstream LLM call comfortably below the 16k token limit.",
+        "planner_notes": (
+            "Evidence-backed agentic pipeline: chunks → claim extraction → "
+            "routing → external retrieval → verification (with retry) → "
+            "interpretable credibility scoring. "
+            "All LLM inputs are bounded to stay under 16k tokens."
+        ),
     }
     prompt = load_prompt(
         "planner_agent.txt",
@@ -131,6 +196,7 @@ def planner_agent_node(state: EvaluatorState) -> EvaluatorState:
                 "abstract": document.abstract[:1200],
                 "reference_count": len(document.references),
                 "section_count": len(document.sections),
+                "chunk_count": len(document.chunks),
             },
             indent=2,
         ),
@@ -205,13 +271,122 @@ def citation_expert_node(state: EvaluatorState) -> EvaluatorState:
     }
 
 
+# ---------------------------------------------------------------------------
+# Evidence retrieval node — the new agentic heart of the pipeline
+#
+# Routing logic:
+#   external_factcheck  → retrieve + verify (with one retry if evidence is weak)
+#   consistency_only    → skip retrieval (handled by existing consistency agent)
+#   skip                → no retrieval
+#
+# Retry loop (minimal agentic behaviour):
+#   1. Retrieve and verify.
+#   2. If verdict is insufficient/paper-only AND claim is high-importance → retry once
+#      with a reformulated broader query.
+#   3. Prefer the retry result only if it gives a more decisive verdict.
+# ---------------------------------------------------------------------------
+
+def evidence_retrieval_node(state: EvaluatorState) -> EvaluatorState:
+    claims = state.get("claims", [])
+    document = state["document"]
+    paper_title = document.title
+
+    evidence_results = []
+    routing_log = []
+
+    for claim in claims:
+        decision = routing_decision(claim)
+        log_entry: dict[str, Any] = {
+            "claim_id": claim.claim_id,
+            "claim_type": claim.claim_type,
+            "importance": claim.importance,
+            "routing_decision": decision,
+        }
+
+        if decision != "external_factcheck":
+            log_entry["action"] = "skipped"
+            routing_log.append(log_entry)
+            continue
+
+        # Build queries and retrieve evidence.
+        queries = build_queries(claim, paper_title=paper_title)
+        log_entry["queries"] = queries
+
+        raw_evidence = _RETRIEVER.retrieve_for_queries(
+            queries,
+            max_per_query=5,
+            global_cap=10,
+        )
+        ranked_evidence = rank_evidence(claim, raw_evidence, top_k=_VERIFIER_TOP_K)
+
+        # Paper-local context for verifier grounding (bounded).
+        paper_context = _paper_context_for_claim(document, claim)
+
+        # First verification pass.
+        result = verify_claim(claim, paper_context=paper_context, evidence_items=ranked_evidence)
+        log_entry["verdict_pass1"] = result.verdict
+
+        # Agentic retry: if evidence is weak and claim is high-importance, try once more.
+        if should_retry(result, claim):
+            retry_query = build_retry_query(claim, paper_title=paper_title)
+            log_entry["retry_query"] = retry_query
+            retry_raw = _RETRIEVER.retrieve_for_queries(
+                [retry_query],
+                max_per_query=5,
+                global_cap=8,
+            )
+            retry_ranked = rank_evidence(claim, retry_raw, top_k=_VERIFIER_TOP_K)
+            if retry_ranked:
+                retry_result = verify_claim(
+                    claim,
+                    paper_context=paper_context,
+                    evidence_items=retry_ranked,
+                )
+                log_entry["verdict_pass2"] = retry_result.verdict
+                # Prefer retry if it gives a more informative verdict.
+                _WEAK = {"insufficient_evidence", "paper_supported_only"}
+                if result.verdict in _WEAK and retry_result.verdict not in _WEAK:
+                    result = retry_result
+                    log_entry["used_retry"] = True
+                else:
+                    log_entry["used_retry"] = False
+            else:
+                log_entry["retry_found_evidence"] = False
+
+        evidence_results.append(result)
+        log_entry["final_verdict"] = result.verdict
+        log_entry["action"] = "verified"
+        routing_log.append(log_entry)
+
+        logger.info(
+            "Claim %s (%s / %s): %s → %s",
+            claim.claim_id,
+            claim.claim_type,
+            claim.importance,
+            decision,
+            result.verdict,
+        )
+
+    return {"evidence_results": evidence_results, "routing_log": routing_log}
+
+
 def factcheck_expert_node(state: EvaluatorState) -> EvaluatorState:
-    return {
-        "factcheck": run_factcheck_agent(
+    """
+    Internal fact-check agent.
+
+    If evidence_results are available (v2), convert them to the legacy FactCheckResult
+    so all downstream agents and the report builder receive a consistent interface.
+    Fall back to the original internal LLM fact-checker if no evidence results exist.
+    """
+    evidence_results = state.get("evidence_results") or []
+    if evidence_results:
+        factcheck = evidence_factcheck_to_legacy(evidence_results)
+    else:
+        factcheck = run_factcheck_agent(
             state["claims"],
             prepared_context=state.get("evidence_packets", {}).get("factcheck", ""),
         )
-    }
+    return {"factcheck": factcheck}
 
 
 def novelty_expert_node(state: EvaluatorState) -> EvaluatorState:
@@ -231,8 +406,14 @@ def reviewer_critic_node(state: EvaluatorState) -> EvaluatorState:
     }
     fallback = {
         "calibration_notes": ["All specialist signals appear well-calibrated."],
-        "summary_assessment": "Reviewer-critic fallback used. No calibration concerns identified beyond existing guardrails.",
+        "summary_assessment": (
+            "Reviewer-critic fallback used. "
+            "No calibration concerns identified beyond existing guardrails."
+        ),
     }
+    routing_log = state.get("routing_log", [])
+    evidence_results = state.get("evidence_results", [])
+
     prompt = load_prompt(
         "reviewer_critic.txt",
         schema_json=json.dumps(schema),
@@ -245,6 +426,11 @@ def reviewer_critic_node(state: EvaluatorState) -> EvaluatorState:
                 "factcheck": state["factcheck"].model_dump(),
                 "novelty": state["novelty"].model_dump(),
                 "claim_count": len(state.get("claims", [])),
+                "evidence_checked_claim_count": len(evidence_results),
+                "routing_summary": [
+                    {"claim_id": e["claim_id"], "decision": e["routing_decision"], "verdict": e.get("final_verdict")}
+                    for e in routing_log
+                ],
             },
             indent=2,
         ),
@@ -261,6 +447,8 @@ def credibility_synthesis_node(state: EvaluatorState) -> EvaluatorState:
             state["factcheck"],
             state["novelty"],
             critic_feedback=state.get("critic", {}),
+            evidence_results=state.get("evidence_results") or None,
+            claims=state.get("claims") or None,
         )
     }
 
@@ -286,12 +474,18 @@ def report_builder_node(state: EvaluatorState) -> EvaluatorState:
         state["credibility"],
         state["paper_id"],
         grammar=state["grammar"],
+        evidence_results=state.get("evidence_results") or None,
     )
     return {"report": report, "report_path": str(report_path)}
 
 
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
+
 def build_graph():
     workflow = StateGraph(EvaluatorState)
+
     workflow.add_node("ingest_paper", ingest_paper_node)
     workflow.add_node("planner_agent", planner_agent_node)
     workflow.add_node("evidence_prep_agent", evidence_prep_node)
@@ -299,6 +493,8 @@ def build_graph():
     workflow.add_node("consistency_expert", consistency_expert_node)
     workflow.add_node("grammar_expert", grammar_expert_node)
     workflow.add_node("citation_expert", citation_expert_node)
+    # New: evidence retrieval + verification with routing + retry
+    workflow.add_node("evidence_retrieval", evidence_retrieval_node)
     workflow.add_node("factcheck_expert", factcheck_expert_node)
     workflow.add_node("novelty_expert", novelty_expert_node)
     workflow.add_node("reviewer_critic", reviewer_critic_node)
@@ -312,12 +508,15 @@ def build_graph():
     workflow.add_edge("extract_claims", "consistency_expert")
     workflow.add_edge("consistency_expert", "grammar_expert")
     workflow.add_edge("grammar_expert", "citation_expert")
-    workflow.add_edge("citation_expert", "factcheck_expert")
+    # After citation, route claims to external retrieval before factcheck.
+    workflow.add_edge("citation_expert", "evidence_retrieval")
+    workflow.add_edge("evidence_retrieval", "factcheck_expert")
     workflow.add_edge("factcheck_expert", "novelty_expert")
     workflow.add_edge("novelty_expert", "reviewer_critic")
     workflow.add_edge("reviewer_critic", "credibility_synthesis")
     workflow.add_edge("credibility_synthesis", "build_report")
     workflow.add_edge("build_report", END)
+
     return workflow.compile()
 
 
@@ -338,7 +537,9 @@ def run_pipeline(url: str) -> tuple:
         "critic": final_state.get("critic", {}),
         "credibility": final_state["credibility"],
         "claims": final_state["claims"],
+        "evidence_results": final_state.get("evidence_results", []),
+        "routing_log": final_state.get("routing_log", []),
         "report_path": final_state["report_path"],
         "paper_id": final_state["paper_id"],
-        "graph_mode": "langgraph-sequential-agent-pipeline",
+        "graph_mode": "langgraph-agentic-evidence-backed-pipeline-v2",
     }

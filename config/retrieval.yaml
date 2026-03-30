@@ -1,0 +1,30 @@
+# Retrieval configuration
+# All values here are read by EvidenceRetriever and related components.
+
+# Maximum search queries generated per claim.
+max_queries_per_claim: 4
+
+# Maximum results fetched per query from the search backend.
+max_results_per_query: 5
+
+# Total evidence items kept after deduplication across all queries for one claim.
+global_evidence_cap: 10
+
+# Top-K evidence items forwarded to the verifier (after ranking).
+top_k_for_verifier: 5
+
+# Maximum characters per evidence snippet — keeps token cost bounded.
+snippet_max_chars: 350
+
+# Verifier prompt hard token cap (architectural limit).
+verifier_max_input_tokens: 9000
+
+# Enable/disable web retrieval globally.
+# Also controlled by DISABLE_WEB_RETRIEVAL env var.
+enable_web_retrieval: true
+
+# Retry behaviour for weak-evidence high-importance claims.
+retry:
+  enabled: true
+  max_retries: 1
+  expand_query_on_retry: true
